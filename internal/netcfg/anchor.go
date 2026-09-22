@@ -542,6 +542,65 @@ func SteerRules(o SteerOpts) string {
 	return b.String()
 }
 
+// LogDropOpts parameterises the macOS pflog interception rules.  PF logs the
+// original packet to a dedicated pflog interface and then blocks it; userspace
+// re-emits either the original or a desynchronised packet through BPF.
+type LogDropOpts struct {
+	PFLog string
+	// Iface limits interception to the physical uplink. This is essential
+	// beside a split-routing VPN: traffic already routed into utun must remain
+	// in the VPN, while Direct traffic leaving en0 is the only traffic zapret
+	// should block and re-emit.
+	Iface        string
+	TCPPorts     []PortRange
+	UDPPorts     []PortRange
+	ExcludeTable string
+	TargetTable  string
+	ExemptRoot   bool
+	IPv6         bool
+}
+
+// LogDropRules renders the rules for the pflog+BPF packet transport.  `quick`
+// is essential: no later pass rule may override the drop verdict after the
+// packet has been queued for userspace processing.
+func LogDropRules(o LogDropOpts) string {
+	var b ruleBuilder
+	b.table(o.ExcludeTable)
+	b.table(o.TargetTable)
+	b.line("pass quick on lo0 all")
+	if o.PFLog == "" {
+		return b.String()
+	}
+	af := "inet"
+	if o.IPv6 {
+		af = "inet6"
+	}
+	dst := destClause(o.TargetTable, o.ExcludeTable)
+	user := ""
+	if o.ExemptRoot {
+		user = " user { > root }"
+	}
+	if pl := FormatPorts(o.TCPPorts); pl != "" {
+		if o.Iface != "" {
+			b.linef("block out log (all, to %s) quick on %s %s proto tcp from any to %s port %s%s no state",
+				o.PFLog, o.Iface, af, dst, pl, user)
+		} else {
+			b.linef("block out log (all, to %s) quick %s proto tcp from any to %s port %s%s no state",
+				o.PFLog, af, dst, pl, user)
+		}
+	}
+	if pl := FormatPorts(o.UDPPorts); pl != "" {
+		if o.Iface != "" {
+			b.linef("block out log (all, to %s) quick on %s %s proto udp from any to %s port %s%s no state",
+				o.PFLog, o.Iface, af, dst, pl, user)
+		} else {
+			b.linef("block out log (all, to %s) quick %s proto udp from any to %s port %s%s no state",
+				o.PFLog, af, dst, pl, user)
+		}
+	}
+	return b.String()
+}
+
 // RedirOpts parameterises the proxy transport's ruleset.
 type RedirOpts struct {
 	// ListenAddr is the address the local listener is bound to. Defaults to

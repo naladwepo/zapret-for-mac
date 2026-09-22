@@ -135,20 +135,20 @@ reach argv or a system file; the 32k-entry table load goes through stdin, not ar
 ## 2. Properties that can only be verified with root and real traffic
 
 The test suite runs **without root and without network access**. Everything below
-is therefore *reasoned* and, where possible, *probed by `zapret-probe` on a real
+is therefore *reasoned* and, where possible, *probed by `zaprctl probe` on a real
 machine* — but it is not covered by `go test`.
 
 ### 2.1 The whole premise of the divert transport
 
 That `pass out quick route-to (utunN peer) ... no state` actually hands an outbound
 packet to a `read(2)` on our utun, and that not re-emitting it is a drop. This is
-what `zapret-probe` stage 6 exists to answer, and it needs root plus a real
+what `zaprctl probe` stage 6 exists to answer, and it needs root plus a real
 interface. Nothing in `go test` proves it.
 
 ### 2.2 That a BPF write reaches the wire and bypasses pf
 
 `BIOCSHDRCMPLT` plus a raw Ethernet frame write on the uplink. Verified by
-`zapret-probe` stage 7 (it writes a packet and captures it on a second BPF handle).
+`zaprctl probe` stage 7 (it writes a packet and captures it on a second BPF handle).
 The *loop-breaking* property — that our own injections do not come back through the
 utun — is argued from the fact that a BPF write skips `ip_output` and therefore pf,
 and is enforced belt-and-braces by `user { > root }` on the steering rule (forced
@@ -371,7 +371,7 @@ by either endpoint. Raise it if that matters for your workload.
 
 ## Update: the pf.conf edit is gone (verified on hardware)
 
-`zapret-probe` ran on the target machine (macOS 26.5.1, arm64, SIP enabled) with
+`zaprctl probe` ran on the target machine (macOS 26.5.1, arm64, SIP enabled) with
 all ten stages PASS and the verdict `full-parity-possible`. Two things changed as
 a result, and one honest caveat was added.
 

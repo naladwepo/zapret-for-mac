@@ -161,24 +161,23 @@ It is now listed in System Settings > General > Login Items & Extensions, enable
 That entry is disclosure, not an approval gate — but if you switch it off there,
 the daemon will not start again until you switch it back on.
 
-IF ANYTHING GOES WRONG and connections on 80/443 stop working, this one command
-always restores normal networking (it only empties our own pf anchor):
+IF ANYTHING GOES WRONG and connections on the strategy ports stop working, this
+command resolves and empties the exact pf anchor used on this Mac:
 
-  sudo pfctl -a %s -F all
+  sudo %s guard --data %q --anchor %s --verbose
 
 Next:
   zaprctl status
   zaprctl list
-  sudo zaprctl use general
-`, o.anchor)
+  sudo zaprctl use cloud-gaming
+`, prog, o.dataDir, o.anchor)
 	return exitOK
 }
 
 // installGuard writes and bootstraps the periodic anchor-guard job.
 //
-// It is what makes the steering rules survivable: they name a utun that dies with
-// the daemon's process, and pf drops — not passes — a packet whose route-to
-// interface is gone. See cmd/zapretd/guard.go for the full reasoning.
+// It is what makes the pflog interception rules survivable: originals stay
+// blocked if the daemon dies before removing its anchor. See guard.go.
 func installGuard(prog string, o options, stdout, stderr io.Writer) int {
 	args := []string{"guard", "--data", o.dataDir}
 	if o.anchor != defaultOptions().anchor {
@@ -276,6 +275,9 @@ func plistArgs(o options) []string {
 	if o.noExemptRoot {
 		args = append(args, "--no-exempt-root")
 	}
+	if o.allowVPN {
+		args = append(args, "--allow-vpn")
+	}
 	if o.dryRun {
 		args = append(args, "--dry-run")
 	}
@@ -358,6 +360,9 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 		StateDir:   stateDir,
 		Logf:       func(f string, a ...any) { fmt.Fprintf(stdout, "    "+f+"\n", a...) },
 	})
+	if _, err := pf.ResolveAnchor(); err != nil {
+		step("resolve the "+o.anchor+" anchor", err)
+	}
 	step("flush the "+o.anchor+" anchor", pf.FlushRules())
 	if !*keepPf {
 		perr := pf.RemoveAnchorStatements()

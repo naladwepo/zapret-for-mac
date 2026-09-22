@@ -103,6 +103,10 @@ type PickOpts struct {
 	// the first perfect score wins, because that is what the user asked for and
 	// every further candidate costs another round of probes.
 	NoEarlyStop bool
+	// Rounds repeats the probe set for each candidate. A candidate must keep its
+	// controls alive in every round; all target results are included in the
+	// score, so a one-off success cannot win a stability run. Defaults to 1.
+	Rounds int
 	// SkipUnsupported drops candidates the transport cannot fully honour instead
 	// of testing them anyway. Off by default: a strategy whose fake ops are
 	// skipped can still work through its splits alone, and that is worth
@@ -125,6 +129,9 @@ func (o PickOpts) withDefaults() PickOpts {
 	if o.Settle <= 0 {
 		o.Settle = 1500 * time.Millisecond
 	}
+	if o.Rounds <= 0 {
+		o.Rounds = 1
+	}
 	if o.Logf == nil {
 		o.Logf = func(string, ...any) {}
 	}
@@ -142,6 +149,18 @@ func PickProbes() []Probe {
 		{Name: "googlevideo (playback)", URL: "https://redirector.googlevideo.com/", Download: 16 * 1024},
 		{Name: "discord.com", URL: "https://discord.com/"},
 		{Name: "gateway.discord.gg", URL: "tls://gateway.discord.gg:443"},
+	}
+}
+
+// DiscordPickProbes is the short but protocol-complete set used by
+// `autopick --suite discord`. Unlike the generic picker it verifies the API
+// request, the real WebSocket upgrade and the UDP/STUN voice path.
+func DiscordPickProbes() []Probe {
+	return []Probe{
+		{Name: "control example.com", URL: "https://example.com/", Control: true, Expect: 200},
+		{Name: "discord API", URL: "https://discord.com/api/v10/gateway"},
+		{Name: "discord Gateway WSS", URL: "wss://gateway.discord.gg/?v=10&encoding=json"},
+		{Name: "UDP/STUN voice path", URL: "stun://stun.l.google.com:19302"},
 	}
 }
 
@@ -421,17 +440,30 @@ func Pick(ctx context.Context, o PickOpts) (PickResult, error) {
 			return res, ctx.Err()
 		}
 
-		results, err := Run(ctx, o.Probes, o.Run)
-		if err != nil {
-			c.Err = err.Error()
-			c.Skipped = "probes could not run"
-			restore("cancelled")
-			res.Ranked = rankCandidates(list)
-			finishPick(&res, best)
-			return res, err
+		controlsOKEveryRound := true
+		for round := 1; round <= o.Rounds; round++ {
+			results, err := Run(ctx, o.Probes, o.Run)
+			if err != nil {
+				c.Err = err.Error()
+				c.Skipped = "probes could not run"
+				restore("cancelled")
+				res.Ranked = rankCandidates(list)
+				finishPick(&res, best)
+				return res, err
+			}
+			c.Results = append(c.Results, results...)
+			if !ScoreResults(results).Valid() {
+				controlsOKEveryRound = false
+			}
+			if o.Rounds > 1 {
+				o.Logf("diag: strategy %q round %d/%d scored %s", c.Name, round, o.Rounds,
+					ScoreResults(results))
+			}
 		}
-		c.Results = results
-		c.Score = ScoreResults(results)
+		c.Score = ScoreResults(c.Results)
+		if !controlsOKEveryRound {
+			c.Score.ControlPassed = 0
+		}
 		res.Tested++
 		o.Logf("diag: strategy %q scored %s", c.Name, c.Score)
 
@@ -445,8 +477,9 @@ func Pick(ctx context.Context, o PickOpts) (PickResult, error) {
 			//     exactly what a fake whose decoy reaches the server does.
 			//
 			// So deactivate the candidate and re-measure the controls. If they
-			// come back, the strategy was the culprit: record that (it is a real
-			// finding about the strategy, not a dead end) and keep sweeping.
+			// come back, the strategy was the culprit. If they do not, keep
+			// sweeping anyway: a transient control failure or stale flow state must
+			// not turn the remaining candidates into misleading 0/0 rows.
 			c.Skipped = "control probes failed, so this measurement says nothing about the strategy"
 			if o.Client != nil && res.Original != "" && res.Original != c.Name {
 				if aerr := o.Client.Activate(ctx, res.Original); aerr == nil {
@@ -464,10 +497,10 @@ func Pick(ctx context.Context, o PickOpts) (PickResult, error) {
 					}
 				}
 			}
-			restore("the machine has no working internet connection")
-			res.Ranked = rankCandidates(list)
-			finishPick(&res, best)
-			return res, nil
+			c.Skipped = "control probes failed and did not recover during the immediate re-check; " +
+				"candidate excluded, sweep continued"
+			o.Logf("diag: controls still fail after strategy %q; excluding it and continuing", c.Name)
+			continue
 		}
 		if best == nil || c.Score.Better(best.Score) {
 			best = c

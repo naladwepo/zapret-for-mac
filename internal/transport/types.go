@@ -1,8 +1,8 @@
 // Package transport defines the datapath contract. Two implementations exist:
 //
-//   - transport/divert — pf `pass out route-to (utunN ...)` steers the port
-//     window into a utun the daemon owns; the daemon re-emits packets with a
-//     BPF Ethernet write on the physical interface (bypassing pf, so no loop).
+//   - transport/divert — pf logs and blocks matching originals on a dedicated
+//     pflog interface; the daemon re-emits packets with a BPF Ethernet write on
+//     the physical interface (bypassing pf, so no loop).
 //     Inbound traffic is never steered, so no userspace TCP stack is needed and
 //     the application's real 4-tuple is preserved. Full winws-class Caps.
 //
@@ -83,12 +83,9 @@ type Config struct {
 	// AllowTunnelDefault permits the packet datapath to run while a tunnel
 	// interface holds an IPv4 default route (a full-tunnel VPN).
 	//
-	// The default is to refuse, and that refusal protects connectivity rather
-	// than merely saving effort: with a VPN default route the kernel picks the
-	// SOURCE ADDRESS from the tunnel, so the packets pf hands us carry the
-	// tunnel's address. Re-emitting those on the physical link puts packets with
-	// a foreign source address on the LAN, the gateway drops them, and every
-	// steered connection dies — including ones that were never censored.
+	// This is safe only when the VPN has already classified the target as Direct:
+	// its outbound socket then carries the physical source address. A blind
+	// full-tunnel flow still carries a tunnel source and cannot be re-emitted.
 	AllowTunnelDefault bool
 
 	Verbose int

@@ -398,10 +398,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.addWarning(w)
 	}
 	if pre.VPNActive {
-		d.log.Printf("WARNING: the IPv4 default route goes through a tunnel (%s). "+
-			"A full-tunnel VPN carries your traffic past the point where we could desync it, "+
-			"and the packet re-emit needs a physical uplink: expect the bypass to do nothing until the VPN is off.",
-			pre.DefaultIface)
+		if d.opts.allowVPN {
+			d.log.Printf("split-routing VPN detected on %s; direct targets will be re-emitted through the physical uplink",
+				pre.DefaultIface)
+		} else {
+			d.log.Printf("WARNING: the IPv4 default route goes through a tunnel (%s). "+
+				"Configure split routing or disconnect the VPN before starting the datapath.", pre.DefaultIface)
+		}
 	}
 	if len(pre.ForeignAnchors) > 0 {
 		d.log.Printf("WARNING: /etc/pf.conf also references foreign pf anchors %v; another network tool may fight us over the ruleset",
@@ -532,20 +535,17 @@ func (d *Daemon) banner() {
 		d.log.Printf("  quic       blocked (UDP/443 dropped so browsers fall back to TCP)")
 	}
 	if d.opts.noExemptRoot {
-		d.log.Printf("  NOTE       root-owned traffic is steered too (--no-exempt-root): watch for loops")
+		d.log.Printf("  direct VPN sockets root-owned traffic included (--no-exempt-root); BPF reinjection bypasses pf")
 	}
 	if d.opts.dryRun {
 		d.log.Printf("  DRY RUN    no privileged change will actually be made")
 	}
-	// The one line an operator needs when something goes wrong. The steering rule
-	// route-to's the port window at a utun that dies with this process, and pf
-	// DROPS a packet whose route-to interface is gone — so an unclean death of this
-	// daemon black-holes 80/443 until the anchor is emptied. `zapretd guard` (a
-	// periodic launchd job installed by `install-daemon`) does that automatically;
-	// this is the manual escape hatch, and it must be in the log before anything
-	// can go wrong.
+	// The one line an operator needs when something goes wrong. The pflog
+	// transport blocks originals before re-injecting transformed copies, so stale
+	// rules must be removed if the process dies. The periodic guard normally does
+	// that automatically; this is the manual escape hatch.
 	d.log.Printf("  RECOVERY   if connections on the window ports stop working: sudo pfctl -a %s -F all",
-		d.opts.anchor)
+		d.pf.EffectiveAnchor())
 }
 
 // cleanup reverts everything the daemon still owns. It is safe to call twice and
@@ -766,7 +766,7 @@ func (d *Daemon) compileStrategy(spec string, caps desync.Caps) (*strategy.Strat
 func (d *Daemon) resolveStrategyPath(spec string) (string, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		spec = "general"
+		spec = DefaultStrategy
 	}
 	if strings.ContainsRune(spec, os.PathSeparator) || strings.HasSuffix(strings.ToLower(spec), ".toml") {
 		if _, err := os.Stat(spec); err == nil {
@@ -1044,18 +1044,11 @@ func (d *Daemon) candidates() ([]string, error) {
 		return []string{d.opts.transport}, nil
 	}
 
-	d.mu.Lock()
-	chosen := d.trChoice
-	d.mu.Unlock()
-	switch chosen {
-	case transportDivert:
-		return []string{transportDivert, transportProxy}, nil
-	case transportProxy:
-		return []string{transportProxy}, nil
-	}
-	// No detection has run (or it concluded "none"): try both anyway rather than
-	// refusing to do anything. The datapath's own Start reports precisely why it
-	// cannot run, which is more useful than the probe's summary.
+	// The packet datapath now has a second interceptor: PF block+log through a
+	// dedicated pflog interface.  The legacy capability probe only knows how to
+	// test route-to/utun, so a failed steering result must not suppress this new
+	// path. Start performs the definitive privileged check and proxy remains the
+	// safe fallback.
 	return []string{transportDivert, transportProxy}, nil
 }
 
@@ -1107,7 +1100,7 @@ func (d *Daemon) detectTransport(ctx context.Context) {
 	for _, n := range caps.Notes {
 		d.log.Printf("  probe: %s", n)
 	}
-	if caps.TunnelDefaultRoute != "" {
+	if caps.TunnelDefaultRoute != "" && !d.opts.allowVPN {
 		d.addWarning("the default route goes through " + caps.TunnelDefaultRoute +
 			": a full-tunnel VPN carries traffic past the point where we could desync it")
 	}
@@ -1692,14 +1685,18 @@ func (d *Daemon) capsFrom(caps desync.Caps, name, reason string, strat *strategy
 // pfData collects the pf view. It costs two pfctl invocations, which is fine for
 // an on-demand command.
 func (d *Daemon) pfData(drift string, verified time.Time) ctl.PFData {
-	out := ctl.PFData{Anchor: d.opts.anchor, Token: d.pf.Token(), Drift: drift}
+	out := ctl.PFData{Anchor: d.pf.EffectiveAnchor(), Token: d.pf.Token(), Drift: drift}
 	if !verified.IsZero() {
 		out.LastVerify = verified.Format(time.RFC3339)
 	}
 	if on, err := d.pf.Enabled(); err == nil {
 		out.Enabled = on
 	}
-	if b, err := os.ReadFile(d.pf.PfConfPath()); err == nil {
+	if d.pf.Mode() == netcfg.AnchorModeWildcard {
+		// A stock macOS ruleset reaches com.apple/<name> through
+		// anchor "com.apple/*"; no literal statement for our child exists.
+		out.AnchorReferenced = true
+	} else if b, err := os.ReadFile(d.pf.PfConfPath()); err == nil {
 		out.AnchorReferenced = netcfg.AnchorStatementsPresent(b, d.opts.anchor)
 	}
 	filter, ferr := d.pf.Rules()

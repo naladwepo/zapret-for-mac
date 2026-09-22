@@ -1,6 +1,6 @@
 //go:build darwin
 
-// Command zapret-probe answers, on the machine it runs on, one question that
+// The embedded capability probe answers, on the machine it runs on, one question that
 // decides this project's entire feature set: can a userspace program on macOS
 // intercept, inspect and re-emit its own outbound TCP packets?
 //
@@ -20,7 +20,7 @@
 //
 // Usage:
 //
-//	sudo zapret-probe [--iface en0] [--target 1.1.1.1] [--port 443]
+//	sudo zaprctl probe [--iface en0] [--target 1.1.1.1] [--port 443]
 //	                  [--utun-unit 9] [--json] [--timeout 8s]
 //
 // The exit status is always 0 — a FAIL is data, not a crash — except 2 when the
@@ -167,7 +167,13 @@ type probe struct {
 	cleanupLog     []string
 }
 
-func main() {
+func runEmbeddedProbe(args []string) {
+	// The probe historically used package flag globals. Give it a private flag
+	// set now that it lives inside the user-facing CLI, and pass only the probe
+	// arguments (not the top-level `probe` command) to it.
+	flag.CommandLine = flag.NewFlagSet("zaprctl probe", flag.ContinueOnError)
+	flag.CommandLine.SetOutput(os.Stderr)
+	os.Args = append([]string{"zaprctl probe"}, args...)
 	p := &probe{pfFD: -1, started: time.Now()}
 	var targetStr string
 	flag.StringVar(&p.ifaceFlag, "iface", "", "physical interface to use (default: the interface carrying the IPv4 default route)")
@@ -185,16 +191,16 @@ func main() {
 
 	addr, err := netip.ParseAddr(targetStr)
 	if err != nil || !addr.Is4() {
-		fmt.Fprintf(os.Stderr, "zapret-probe: --target must be a literal IPv4 address, got %q\n", targetStr)
+		fmt.Fprintf(os.Stderr, "zaprctl probe: --target must be a literal IPv4 address, got %q\n", targetStr)
 		os.Exit(2)
 	}
 	p.target = addr
 	if p.port < 1 || p.port > 65535 {
-		fmt.Fprintf(os.Stderr, "zapret-probe: --port out of range: %d\n", p.port)
+		fmt.Fprintf(os.Stderr, "zaprctl probe: --port out of range: %d\n", p.port)
 		os.Exit(2)
 	}
 	if p.utunUnit < 0 || p.utunUnit > 1000 {
-		fmt.Fprintf(os.Stderr, "zapret-probe: --utun-unit out of range: %d\n", p.utunUnit)
+		fmt.Fprintf(os.Stderr, "zaprctl probe: --utun-unit out of range: %d\n", p.utunUnit)
 		os.Exit(2)
 	}
 	if p.timeout < time.Second {
@@ -206,7 +212,7 @@ func main() {
 	signal.Notify(sigc, unix.SIGINT, unix.SIGTERM)
 	go func() {
 		s := <-sigc
-		fmt.Fprintf(os.Stderr, "\nzapret-probe: %v received, undoing all changes...\n", s)
+		fmt.Fprintf(os.Stderr, "\nzaprctl probe: %v received, undoing all changes...\n", s)
 		p.cleanup()
 		for _, l := range p.cleanupLog {
 			fmt.Fprintf(os.Stderr, "  cleanup: %s\n", l)
@@ -346,7 +352,7 @@ const exitInterrupted = 3
 
 // tokenWitnessPath is where an interrupted probe leaves its pf reference token, so
 // a SIGKILLed run can still be cleaned up by hand.
-const tokenWitnessPath = "/tmp/zapret-probe.pf-token"
+const tokenWitnessPath = "/tmp/zapret-mac-probe.pf-token"
 
 // writeTokenWitness persists the pf reference token. Failures are reported as a
 // note, never fatal: the probe changes nothing that depends on it.
@@ -1776,7 +1782,7 @@ func (p *probe) emitJSON(v, rationale string) {
 		iface = p.route.IfName
 	}
 	r := report{
-		Tool:      "zapret-probe",
+		Tool:      "zaprctl probe",
 		StartedAt: p.started.Format(time.RFC3339),
 		Target:    p.targetAddrPort(),
 		Iface:     iface,
@@ -1789,7 +1795,7 @@ func (p *probe) emitJSON(v, rationale string) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(r); err != nil {
-		fmt.Fprintf(os.Stderr, "zapret-probe: cannot encode JSON report: %v\n", err)
+		fmt.Fprintf(os.Stderr, "zaprctl probe: cannot encode JSON report: %v\n", err)
 	}
 }
 
@@ -1804,7 +1810,7 @@ func (p *probe) emitTable(v, rationale string) {
 	if p.utun != nil {
 		utun = p.utun.Name
 	}
-	fmt.Fprintf(w, "zapret-probe  target=%s  iface=%s  utun=%s  %s\n",
+	fmt.Fprintf(w, "zaprctl probe  target=%s  iface=%s  utun=%s  %s\n",
 		p.targetAddrPort(), orDash(iface), utun, p.started.Format(time.RFC3339))
 	fmt.Fprintln(w, strings.Repeat("=", 100))
 

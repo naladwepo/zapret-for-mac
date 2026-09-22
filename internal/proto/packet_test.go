@@ -212,6 +212,37 @@ func TestMarshalParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseRestoresOffloadedIPLength(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+		dst  string
+		off  int
+		base int
+	}{
+		{"ipv4", "192.0.2.1", "198.51.100.1", 2, 0},
+		{"ipv6", "2001:db8::1", "2001:db8::2", 4, ipv6FixedHdrLen},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tm := &Tmpl{
+				Src: mustAddr(t, tc.src), Dst: mustAddr(t, tc.dst),
+				SrcPort: 12345, DstPort: 443, Flags: TCPSyn,
+			}
+			raw, err := tm.Marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			binary.BigEndian.PutUint16(raw[tc.off:tc.off+2], 0)
+			if _, err := Parse(raw); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := int(binary.BigEndian.Uint16(raw[tc.off:tc.off+2])), len(raw)-tc.base; got != want {
+				t.Fatalf("restored IP length = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 func TestMarshalErrors(t *testing.T) {
 	tests := []struct {
 		name string

@@ -20,7 +20,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo de
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := CGO_ENABLED=0 GOOS=darwin
 
-CMDS      := zapretd zaprctl zapret-probe batconv
+CMDS      := zapretd zaprctl batconv
 
 .PHONY: all build test vet fmt clean install uninstall reinstall probe status logs check
 
@@ -62,9 +62,9 @@ check: fmt vet test
 # ---- capability probe -------------------------------------------------------
 # Answers whether the packet-level datapath works on THIS machine. Needs root;
 # reverts every change it makes.
-probe: $(BIN)/zapret-probe
+probe: $(BIN)/zaprctl
 	@echo "==> running the capability probe (needs your password, changes nothing permanently)"
-	sudo $(BIN)/zapret-probe
+	sudo $(BIN)/zaprctl probe
 
 # ---- install ----------------------------------------------------------------
 install: build
@@ -74,8 +74,15 @@ install: build
 	sudo install -m 0644 lists/*.txt "$(DATADIR)/lists/"
 	sudo install -m 0644 fakes/*.bin "$(DATADIR)/fakes/"
 	sudo install -m 0644 strategies/*.toml "$(DATADIR)/strategies/"
-	sudo $(LIBEXEC)/zapretd install-daemon --plist "$(PLIST)" --data "$(DATADIR)"
-	@echo "==> installed. Pick a strategy:  zaprctl list  &&  sudo zaprctl use general"
+	sudo $(LIBEXEC)/zapretd install-daemon --plist "$(PLIST)" --data "$(DATADIR)" \
+		--transport divert --allow-vpn
+	@for attempt in 1 2 3 4 5; do \
+		sudo $(PREFIX)/bin/zaprctl use cloud-gaming && exit 0; \
+		sleep 1; \
+	done; exit 1
+	@echo "==> installed with pflog/BPF, active-VPN support and cloud-gaming default"
+	@echo "==> split routing: zaprctl router happ --install, accept it in Happ, then reconnect the VPN"
+	@echo "==> verify: zaprctl test --suite discord"
 
 uninstall:
 	-sudo $(PREFIX)/bin/zaprctl stop

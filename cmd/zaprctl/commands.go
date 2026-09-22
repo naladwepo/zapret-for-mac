@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,7 +13,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +30,32 @@ import (
 	"github.com/naladwepo/zapret-for-mac/internal/strategy"
 	"github.com/naladwepo/zapret-for-mac/internal/vpn"
 )
+
+// happRoutingProfile is the documented payload accepted by
+// happ://routing/onadd/<base64>. String booleans are intentional: Happ's public
+// profile format spells them this way.
+type happRoutingProfile struct {
+	Name              string            `json:"Name"`
+	GlobalProxy       string            `json:"GlobalProxy"`
+	RemoteDNSType     string            `json:"RemoteDNSType"`
+	RemoteDNSDomain   string            `json:"RemoteDNSDomain"`
+	RemoteDNSIP       string            `json:"RemoteDNSIP"`
+	DomesticDNSType   string            `json:"DomesticDNSType"`
+	DomesticDNSDomain string            `json:"DomesticDNSDomain"`
+	DomesticDNSIP     string            `json:"DomesticDNSIP"`
+	GeoIPURL          string            `json:"Geoipurl"`
+	GeoSiteURL        string            `json:"Geositeurl"`
+	DNSHosts          map[string]string `json:"DnsHosts"`
+	DirectSites       []string          `json:"DirectSites"`
+	DirectIP          []string          `json:"DirectIp"`
+	ProxySites        []string          `json:"ProxySites"`
+	ProxyIP           []string          `json:"ProxyIp"`
+	BlockSites        []string          `json:"BlockSites"`
+	BlockIP           []string          `json:"BlockIp"`
+	DomainStrategy    string            `json:"DomainStrategy"`
+	FakeDNS           string            `json:"FakeDNS"`
+	RouteOrder        string            `json:"RouteOrder"`
+}
 
 // ---------------------------------------------------------------------------
 // transport selection
@@ -2123,11 +2154,16 @@ func (c *cli) hostsSource() string {
 // creates go through the live datapath.
 func (c *cli) cmdTest(ctx context.Context, args []string) int {
 	strat := ""
-	rest, code := c.parseCmd("test", "test [--strategy X] [target...] [--json]", args, func(fs *flag.FlagSet) {
+	suite := "all"
+	rest, code := c.parseCmd("test", "test [--suite all|discord] [--strategy X] [target...] [--json]", args, func(fs *flag.FlagSet) {
 		fs.StringVar(&strat, "strategy", "", "activate this strategy first")
+		fs.StringVar(&suite, "suite", "all", "probe suite: all or discord")
 	})
 	if code != parseContinue {
 		return code
+	}
+	if os.Geteuid() == 0 {
+		return c.fail(errors.New("test must run without sudo: the default pf rules exempt root traffic, so a root probe bypasses zapret; run `zaprctl test` as your user (the control socket grants access to the admin group)"))
 	}
 	// The probes MUST run in this process, not in the daemon.
 	//
@@ -2138,7 +2174,13 @@ func (c *cli) cmdTest(ctx context.Context, args []string) int {
 	// normal application — which is precisely what happened: the browser played
 	// YouTube while this command called it blocked. Running here, as the
 	// invoking user, measures what applications actually experience.
-	data, err := c.selftestLocal(ctx, rest, strat)
+	if suite != "all" && suite != "discord" {
+		return c.fail(fmt.Errorf("unknown test suite %q; use all or discord", suite))
+	}
+	if suite != "all" && len(rest) > 0 {
+		return c.fail(errors.New("custom targets cannot be combined with --suite"))
+	}
+	data, err := c.selftestLocal(ctx, rest, strat, suite)
 	if err != nil {
 		return c.fail(err)
 	}
@@ -2583,7 +2625,7 @@ func (c *cli) printVPN(v ctl.VPNData) {
 		}
 	}
 	if len(v.TunnelDefaults) > 0 {
-		fmt.Fprintf(c.out, "\ntunnel default route: %s — the packet datapath cannot run while this is held\n",
+		fmt.Fprintf(c.out, "\ntunnel default route: %s — zapret needs split-routing mode while this is held\n",
 			strings.Join(v.TunnelDefaults, ", "))
 	} else {
 		fmt.Fprintln(c.out, "\nno tunnel holds a default route — the packet datapath can run")
@@ -2679,6 +2721,314 @@ func localTunnelDefaults() ([]string, error) {
 	return out, nil
 }
 
+// cmdRouter generates routing policy for the VPN client detected on the target
+// machine. Happ is the only supported routing-profile adapter.
+func (c *cli) cmdRouter(ctx context.Context, args []string) int {
+	var install bool
+	var output string
+	rest, code := c.parseCmd("router", "router happ [--install] [--output FILE] [--json]", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&install, "install", false, "open the generated profile in Happ and make it active")
+		fs.StringVar(&output, "output", "", "also write the readable JSON profile to FILE")
+	})
+	if code != parseContinue {
+		return code
+	}
+	if len(rest) != 1 {
+		return c.fail(fmt.Errorf("usage: zaprctl router happ"))
+	}
+	client := strings.ToLower(rest[0])
+	if client != "happ" {
+		return c.fail(fmt.Errorf("router: client %q is not supported; this router is available only for Happ (use `zaprctl router happ`)", rest[0]))
+	}
+	if !happConnected() && install {
+		return c.fail(errors.New("router happ: Happ is not connected; connect the Happ profile first, then retry (or omit --install to only print/save the profile)"))
+	}
+
+	profile, err := c.happProfile()
+	if err != nil {
+		return c.fail(err)
+	}
+	body, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return c.fail(err)
+	}
+	body = append(body, '\n')
+	link := "happ://routing/onadd/" + base64.StdEncoding.EncodeToString(body)
+
+	if output != "" {
+		if err := os.WriteFile(output, body, 0o600); err != nil {
+			return c.fail(fmt.Errorf("write Happ profile %s: %w", output, err))
+		}
+	}
+	if install {
+		if err := exec.CommandContext(ctx, "/usr/bin/open", link).Run(); err != nil {
+			return c.fail(fmt.Errorf("open Happ routing profile: %w", err))
+		}
+	}
+	if c.json {
+		return c.printJSON(struct {
+			Profile   happRoutingProfile `json:"profile"`
+			DeepLink  string             `json:"deep_link"`
+			Installed bool               `json:"opened_in_happ"`
+		}{profile, link, install})
+	}
+	if output != "" {
+		fmt.Fprintf(c.out, "Happ routing profile written to %s\n", output)
+	}
+	if install {
+		fmt.Fprintln(c.out, "Happ profile opened: Russia and zapret hostlists are Direct; every other destination stays Proxy.")
+		fmt.Fprintln(c.out, "Accept the profile in Happ, then reconnect the VPN once so the new routing takes effect.")
+		return exitOK
+	}
+	fmt.Fprintln(c.out, link)
+	fmt.Fprintln(c.out, "\nOpen this link in Happ, activate the profile, then reconnect the VPN.")
+	return exitOK
+}
+
+const happAgentLabel = "io.zapretmac.happ-agent"
+
+func (c *cli) cmdAutostart(ctx context.Context, args []string) int {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	if len(args) > 1 || (action != "install" && action != "remove" && action != "status") {
+		return c.fail(errors.New("usage: zaprctl autostart install|remove|status"))
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return c.fail(err)
+	}
+	path := filepath.Join(home, "Library", "LaunchAgents", happAgentLabel+".plist")
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	switch action {
+	case "status":
+		out, err := exec.CommandContext(ctx, "/bin/launchctl", "print", domain+"/"+happAgentLabel).CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(c.out, "Happ autostart: disabled (%s)\n", strings.TrimSpace(string(out)))
+			return exitOK
+		}
+		fmt.Fprintln(c.out, "Happ autostart: enabled")
+		return exitOK
+	case "remove":
+		_, _ = exec.CommandContext(ctx, "/bin/launchctl", "bootout", domain+"/"+happAgentLabel).CombinedOutput()
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return c.fail(err)
+		}
+		fmt.Fprintln(c.out, "Happ autostart removed")
+		return exitOK
+	case "install":
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return c.fail(err)
+		}
+		program, err := os.Executable()
+		if err != nil {
+			return c.fail(err)
+		}
+		plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>%s</string>
+<key>ProgramArguments</key><array><string>%s</string><string>happ-agent</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>%s</string>
+<key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+`, happAgentLabel, xmlEscape(program), filepath.Join(home, "Library", "Logs", "zapret-happ-agent.log"), filepath.Join(home, "Library", "Logs", "zapret-happ-agent.err.log"))
+		if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
+			return c.fail(err)
+		}
+		_, _ = exec.CommandContext(ctx, "/bin/launchctl", "bootout", domain+"/"+happAgentLabel).CombinedOutput()
+		if out, err := exec.CommandContext(ctx, "/bin/launchctl", "bootstrap", domain, path).CombinedOutput(); err != nil {
+			return c.fail(fmt.Errorf("bootstrap Happ agent: %s: %w", strings.TrimSpace(string(out)), err))
+		}
+		fmt.Fprintln(c.out, "Happ autostart installed: VPN launch and routing refresh enabled")
+		return exitOK
+	}
+	return exitOK
+}
+
+func xmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	return strings.ReplaceAll(s, "'", "&apos;")
+}
+
+func (c *cli) cmdHappAgent(ctx context.Context) int {
+	_ = exec.CommandContext(ctx, "/usr/bin/open", "-a", "Happ").Run()
+	var last [32]byte
+	for {
+		profile, err := c.happProfile()
+		if err == nil {
+			body, _ := json.Marshal(profile)
+			h := sha256.Sum256(body)
+			if h != last {
+				if link, lerr := happLink(profile); lerr == nil {
+					_ = exec.CommandContext(ctx, "/usr/bin/open", link).Run()
+					last = h
+				}
+			}
+		}
+		if !happConnected() {
+			startLastHappService(ctx)
+		}
+		select {
+		case <-ctx.Done():
+			return exitOK
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+func startLastHappService(ctx context.Context) {
+	b, err := exec.CommandContext(ctx, "/usr/sbin/scutil", "--nc", "list").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.Contains(line, "su.ffg.happ") {
+			continue
+		}
+		name := happServiceName(line)
+		if name != "" {
+			_, _ = exec.CommandContext(ctx, "/usr/sbin/scutil", "--nc", "start", name).CombinedOutput()
+		}
+		return
+	}
+}
+
+func happServiceName(line string) string {
+	if !strings.Contains(line, "su.ffg.happ") {
+		return ""
+	}
+	parts := strings.SplitN(line, "\"", 3)
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[1]
+}
+
+// cmdProbe is the single user-facing entry point for the reversible machine
+// capability test. The implementation lives in probe.go so the repository no
+// longer installs a second capability-probe application.
+func (c *cli) cmdProbe(args []string) int {
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(c.err, "zaprctl probe: needs root; retry with: sudo zaprctl probe")
+		return exitDenied
+	}
+	runEmbeddedProbe(args)
+	return exitOK // runEmbeddedProbe exits after emitting its report
+}
+
+// happConnected checks the service state and the actual Network Extension.
+// scutil can report (Disconnected) while Happ's Tunnel.appex still owns a
+// default route, so neither the service listing nor a utun alone is enough.
+func happConnected() bool {
+	b, err := exec.Command("/usr/sbin/scutil", "--nc", "list").Output()
+	if err == nil && happServiceConnected(string(b)) {
+		return true
+	}
+	rep, err := vpn.Detect(localTunnelDefaults)
+	if err != nil || len(rep.TunnelDefaults) == 0 {
+		return false
+	}
+	for _, f := range rep.Findings {
+		if f.Provider != "Happ" {
+			continue
+		}
+		for _, p := range f.Processes {
+			if strings.Contains(p.Path, "/Happ.app/Contents/PlugIns/Tunnel.appex/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func happServiceConnected(list string) bool {
+	for _, line := range strings.Split(list, "\n") {
+		if strings.Contains(line, "su.ffg.happ") &&
+			(strings.Contains(line, "(Connected)") || strings.Contains(line, "(Connecting)")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *cli) happProfile() (happRoutingProfile, error) {
+	domains, err := readRouteDomains(c.findDir("lists"),
+		"list-general.txt", "list-google.txt", "list-general-user.txt",
+		"list-exclude.txt", "list-exclude-user.txt", "list-vk.txt")
+	if err != nil {
+		return happRoutingProfile{}, err
+	}
+	directSites := []string{"geosite:tld-ru", "geosite:category-ru"}
+	for _, domain := range domains {
+		directSites = append(directSites, "domain:"+domain)
+	}
+	return happRoutingProfile{
+		Name:              "zapret-mac: RU + domestic services direct + RKN bypass",
+		GlobalProxy:       "true",
+		RemoteDNSType:     "DoH",
+		RemoteDNSDomain:   "https://cloudflare-dns.com/dns-query",
+		RemoteDNSIP:       "1.1.1.1",
+		DomesticDNSType:   "DoH",
+		DomesticDNSDomain: "https://dns.google/dns-query",
+		DomesticDNSIP:     "8.8.8.8",
+		GeoIPURL:          "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+		GeoSiteURL:        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+		DNSHosts:          map[string]string{"cloudflare-dns.com": "1.1.1.1", "dns.google": "8.8.8.8"},
+		DirectSites:       directSites,
+		DirectIP: []string{"geoip:ru", "geoip:private", "10.0.0.0/8", "172.16.0.0/12",
+			"192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255"},
+		ProxySites:     []string{},
+		ProxyIP:        []string{},
+		BlockSites:     []string{},
+		BlockIP:        []string{},
+		DomainStrategy: "IPIfNonMatch",
+		FakeDNS:        "false",
+		RouteOrder:     "direct-block-proxy",
+	}, nil
+}
+
+func happLink(profile happRoutingProfile) (string, error) {
+	body, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return "happ://routing/onadd/" + base64.StdEncoding.EncodeToString(append(body, '\n')), nil
+}
+
+func readRouteDomains(dir string, names ...string) ([]string, error) {
+	seen := make(map[string]bool)
+	var out []string
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && strings.HasSuffix(name, "-user.txt") {
+				continue
+			}
+			return nil, fmt.Errorf("read routing hostlist %s: %w", path, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if i := strings.IndexByte(line, '#'); i >= 0 {
+				line = line[:i]
+			}
+			host := strings.ToLower(strings.Trim(strings.TrimSpace(line), "."))
+			if host == "" || strings.ContainsAny(host, " /\\\t") || seen[host] {
+				continue
+			}
+			seen[host] = true
+			out = append(out, host)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // cmdAutopick sweeps the installed strategies and leaves the best one running.
 //
 // This is the macOS answer to the Windows ritual of double-clicking one .bat
@@ -2692,9 +3042,13 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 		maxCand   int
 		skipUnsup bool
 		noEarly   bool
+		suite     string
+		rounds    int
 	)
-	rest, code := c.parseCmd("autopick", "autopick [--dry-run] [--max N] [--skip-unsupported] [--no-early-stop] [--json]",
+	rest, code := c.parseCmd("autopick", "autopick [--suite all|discord] [--rounds N] [--dry-run] [--max N] [--skip-unsupported] [--no-early-stop] [--json]",
 		args, func(fs *flag.FlagSet) {
+			fs.StringVar(&suite, "suite", "all", "probe suite: all or discord")
+			fs.IntVar(&rounds, "rounds", 1, "repeat each candidate's probe set N times (1-10)")
 			fs.BoolVar(&dryRun, "dry-run", false, "only report which strategies the active transport fully supports")
 			fs.IntVar(&maxCand, "max", 0, "test at most N strategies (0 = all)")
 			fs.BoolVar(&skipUnsup, "skip-unsupported", false,
@@ -2704,8 +3058,17 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 	if code != parseContinue {
 		return code
 	}
+	if os.Geteuid() == 0 && !dryRun {
+		return c.fail(errors.New("autopick must run without sudo: the default pf rules exempt root traffic, so root probes cannot rank zapret strategies; run `zaprctl autopick` as your user (the control socket grants access to the admin group)"))
+	}
 	if code := c.noArgs("autopick", rest); code != parseContinue {
 		return code
+	}
+	if suite != "all" && suite != "discord" {
+		return c.fail(fmt.Errorf("unknown autopick suite %q; use all or discord", suite))
+	}
+	if rounds < 1 || rounds > 10 {
+		return c.fail(fmt.Errorf("--rounds must be between 1 and 10, got %d", rounds))
 	}
 
 	cl := c.client().WithTimeout(2 * time.Minute)
@@ -2727,6 +3090,7 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 		SkipUnsupported: skipUnsup,
 		NoEarlyStop:     noEarly,
 		DryRun:          dryRun,
+		Rounds:          rounds,
 		Logf:            func(f string, a ...any) { fmt.Fprintf(c.err, "  "+f+"\n", a...) },
 		Client: diag.ClientFuncs{
 			ActivateFn: func(ctx context.Context, name string) error {
@@ -2739,6 +3103,10 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 			},
 		},
 	}
+	if suite == "discord" {
+		opts.Probes = diag.DiscordPickProbes()
+		opts.Run = diag.RunOpts{Concurrency: 2, Timeout: 6 * time.Second}
+	}
 
 	res, err := diag.Pick(ctx, opts)
 	if err != nil {
@@ -2748,7 +3116,7 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 		return c.printJSON(res)
 	}
 
-	fmt.Fprintf(c.out, "autopick — transport %s, %d candidate(s) measured\n\n", st.Transport, res.Tested)
+	fmt.Fprintf(c.out, "autopick — suite %s, transport %s, %d candidate(s) measured\n\n", suite, st.Transport, res.Tested)
 	fmt.Fprintf(c.out, "  %-28s %-8s %-9s %s\n", "STRATEGY", "PASSED", "MEDIAN", "NOTE")
 	for _, cand := range res.Ranked {
 		note := ""
@@ -2784,7 +3152,11 @@ func (c *cli) cmdAutopick(ctx context.Context, args []string) int {
 	default:
 		fmt.Fprintf(c.out, "best: %s (%d/%d targets)%s — now active\n", res.Best,
 			res.BestScore.Passed, res.BestScore.Targets, earlyStopNote(res.StoppedEarly))
-		fmt.Fprintln(c.out, "verify with: zaprctl test")
+		if suite == "discord" {
+			fmt.Fprintln(c.out, "verify with: zaprctl test --suite discord")
+		} else {
+			fmt.Fprintln(c.out, "verify with: zaprctl test")
+		}
 	}
 	return exitOK
 }
@@ -2803,7 +3175,7 @@ func earlyStopNote(early bool) string {
 // --strategy was given, and reporting which strategy/transport is live so the
 // output says what was measured. When no daemon answers, the probes still run
 // and the report simply says so — a bare-path measurement is a useful baseline.
-func (c *cli) selftestLocal(ctx context.Context, targets []string, strat string) (ctl.SelftestData, error) {
+func (c *cli) selftestLocal(ctx context.Context, targets []string, strat, suite string) (ctl.SelftestData, error) {
 	var out ctl.SelftestData
 
 	cl := c.client()
@@ -2827,6 +3199,9 @@ func (c *cli) selftestLocal(ctx context.Context, targets []string, strat string)
 	}
 
 	probes := diag.DefaultProbes()
+	if suite == "discord" {
+		probes = diag.DiscordProbes()
+	}
 	if len(targets) > 0 {
 		var custom []diag.Probe
 		for _, t := range targets {
@@ -2887,6 +3262,12 @@ func probeFromTarget(t string) (diag.Probe, error) {
 // name the table already prints.
 func probeDetail(r diag.Result) string {
 	var parts []string
+	if r.Kind == "stun" && r.OK {
+		parts = append(parts, "STUN binding response")
+	}
+	if r.Kind == "wss" && r.OK {
+		parts = append(parts, "WebSocket upgraded")
+	}
 	if r.Status != 0 {
 		parts = append(parts, fmt.Sprintf("HTTP %d", r.Status))
 	}

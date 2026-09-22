@@ -582,17 +582,38 @@ func TestGeneralStrategyExcludedHost(t *testing.T) {
 	// ipset-gated profiles from matching.
 	srv := mustAddr(t, "1.1.1.1")
 
-	p := mkPkt(t, pktSpec{src: cli, dst: srv, sport: 41200, dport: 443, seq: 1001, ack: 7, payload: tlsHello("mail.ru")})
-	plan, err := e.OnTCP(p)
-	if plan != nil || err != nil {
-		t.Fatalf("OnTCP = (%v, %v), want (nil, nil) for an excluded host", plan, err)
-	}
-	f := flowState(t, e, keyOf(p))
-	if !f.Matched || f.ProfileIdx != -1 || !f.FastPath {
-		t.Fatalf("flow = %+v, want a final no-match on the fast path", f)
+	for _, host := range []string{"mail.ru", "vkplay.ru", "vkplay.live", "vk.com", "userapi.com"} {
+		p := mkPkt(t, pktSpec{src: cli, dst: srv, sport: 41200, dport: 443, seq: 1001, ack: 7, payload: tlsHello(host)})
+		plan, err := e.OnTCP(p)
+		if plan != nil || err != nil {
+			t.Fatalf("OnTCP(%s) = (%v, %v), want (nil, nil) for an excluded host", host, plan, err)
+		}
+		f := flowState(t, e, keyOf(p))
+		if !f.Matched || f.ProfileIdx != -1 || !f.FastPath {
+			t.Fatalf("flow(%s) = %+v, want a final no-match on the fast path", host, f)
+		}
 	}
 	if e.Counters().Matched != 0 || e.Counters().Desyncs != 0 {
 		t.Fatalf("counters = %+v, want no match and no desync", e.Counters())
+	}
+}
+
+func TestCloudGamingStrategyExcludedVKPlay(t *testing.T) {
+	s := loadShipped(t, "cloud-gaming.toml")
+	e := New(s, desync.FullCaps(), desync.FakeSet{})
+	cli := mustAddr(t, "192.0.2.10")
+	srv := mustAddr(t, "95.163.61.43")
+
+	for _, host := range []string{"vkplay.ru", "vkplay.live", "playkey.net", "vk.com", "userapi.com"} {
+		p := mkPkt(t, pktSpec{src: cli, dst: srv, sport: 41250, dport: 443, seq: 1001, ack: 7, payload: tlsHello(host)})
+		plan, err := e.OnTCP(p)
+		if plan != nil || err != nil {
+			t.Fatalf("OnTCP(%s) = (%v, %v), want (nil, nil) for an excluded host", host, plan, err)
+		}
+		f := flowState(t, e, keyOf(p))
+		if !f.Matched || f.ProfileIdx != -1 || !f.FastPath {
+			t.Fatalf("flow(%s) = %+v, want a final no-match on the fast path", host, f)
+		}
 	}
 }
 

@@ -1,5 +1,13 @@
 # zapret-for-mac
 
+Current development line: **0.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the
+porting and routing changes.
+
+> **Native pflog/BPF transport.** The daemon captures PF-logged originals through
+> a private `pflog` interface, applies the desync strategy, and re-emits packets
+> through BPF. `cloud-gaming` is the installed default for Discord, YouTube and
+> cloud gaming; no second checkout or development launcher is required.
+
 **A complete macOS port of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) — DPI bypass for Discord and YouTube, rewritten from scratch in Go for Apple Silicon.**
 
 > **Полный порт [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) на macOS** — обход DPI для Discord и YouTube, переписанный с нуля на Go под Apple Silicon.
@@ -23,17 +31,17 @@ All 21 upstream strategies are here, converted automatically from the original `
 brew tap naladwepo/zapret
 brew install --cask zapret-for-mac
 
-sudo zapret-probe                # what does this machine support? (reverts itself)
-sudo /opt/homebrew/libexec/zapretd install-daemon \
+sudo /usr/local/libexec/zapretd install-daemon \
   --plist /Library/LaunchDaemons/io.zapretmac.zapretd.plist \
-  --data /opt/homebrew/var/zapret-mac
+  --data /opt/homebrew/var/zapret-mac \
+  --transport divert
 
 sudo zaprctl vpn stop            # a full-tunnel VPN makes desync pointless
-sudo zaprctl start --transport divert
-zaprctl autopick && zaprctl test
+sudo zaprctl use cloud-gaming
+zaprctl test --suite discord
 ```
 
-> **Через Homebrew.** `brew tap naladwepo/zapret` и `brew install --cask zapret-for-mac` ставят готовые arm64-бинарники и данные (стратегии, списки, fake-пейлоады) — компилятор не нужен. Дальше: `sudo zapret-probe` выясняет, что умеет ваша машина, и откатывает всё за собой; команда `install-daemon` регистрирует демон в launchd; `sudo zaprctl vpn stop` выключает полнотуннельный VPN, при котором обход бессмыслен; `autopick` перебирает стратегии и оставляет рабочую.
+> **Через Homebrew.** `brew tap naladwepo/zapret` и `brew install --cask zapret-for-mac` ставят готовые arm64-бинарники и данные. `install-daemon --transport divert` регистрирует штатный pflog/BPF daemon в launchd; `sudo zaprctl use cloud-gaming` включает общий профиль Discord, YouTube и cloud gaming.
 
 ### From source / Из исходников
 
@@ -42,26 +50,48 @@ git clone https://github.com/naladwepo/zapret-for-mac.git
 cd zapret-for-mac
 make build
 
-# 1. Find out what your machine can actually do (reverts everything it touches)
-sudo ./bin/zapret-probe
-
-# 2. Install the daemon
+# Install the daemon, pflog/BPF transport, lists and cloud-gaming strategy
 make install
 
-# 3. Turn off any full-tunnel VPN, then start the packet datapath
-sudo zaprctl vpn stop
-sudo zaprctl start --transport divert
-
-# 4. Let it find the strategy that works on your ISP
-zaprctl autopick
-zaprctl test
+# Import the Happ split-routing profile, accept it, and reconnect Happ
+zaprctl router happ --install
+sudo zaprctl start
+zaprctl test --suite discord
 ```
 
-> **Быстрый старт.** Склонируйте репозиторий и соберите (`make build`). Затем: `sudo ./bin/zapret-probe` — выясняет, что умеет именно ваша машина, и откатывает всё, что создал. `make install` — ставит демон. `sudo zaprctl vpn stop` — корректно выключает полнотуннельный VPN, если он есть (при активном VPN обход бесполезен). `sudo zaprctl start --transport divert` — поднимает пакетный датапас. `zaprctl autopick` — перебирает стратегии и оставляет рабочую, `zaprctl test` — проверяет результат.
+> **Быстрый старт.** `make install` собирает и ставит один штатный демон, списки и стратегию `cloud-gaming`; отдельный dev-каталог больше не нужен. Убедись, что Happ подключён, затем запусти `zaprctl router happ --install` и переподключи VPN. После этого `zaprctl test --suite discord` проверит API, Gateway WebSocket, CDN, updater и голосовой UDP/STUN без ручного запуска Discord.
 
 **Requirements:** macOS on Apple Silicon, Go 1.26+, root to run. **Not** required: disabling SIP, kernel extensions, NetworkExtension entitlements, a paid Apple Developer account, a reboot, or notarization.
 
 > **Требования:** macOS на Apple Silicon, Go 1.26+, root для запуска. **Не** требуется: отключать SIP, kext, NetworkExtension, платный Apple Developer, перезагрузка, нотаризация.
+
+Подробная схема маршрутизации для Happ: [PFLOG_PORT_RU.md](PFLOG_PORT_RU.md).
+
+### Автозапуск и смена профилей
+
+После `make install` сам `zapretd` запускается автоматически через системный
+`launchd`. Профиль Happ сохраняется внутри Happ, поэтому после перезагрузки
+достаточно включить у Happ его штатное подключение последнего профиля; повторно
+импортировать маршрут не требуется. `zaprctl router happ --install` проверяет,
+что активен именно Happ, и отказывается работать поверх другого VPN.
+
+Для автоматического запуска Happ и обновления маршрута при изменении списков:
+
+```bash
+zaprctl autostart install
+zaprctl autostart status
+```
+
+Пользовательский LaunchAgent запускает Happ, пытается подключить последний
+сервис через `scutil` и следит за `list-general.txt`, `list-google.txt`,
+`list-general-user.txt`, `list-exclude.txt`, `list-exclude-user.txt` и
+`list-vk.txt`. При изменении любого из них профиль Happ переимпортируется.
+
+Запуск VPN из root-daemon намеренно не выполняется: Happ — пользовательская
+Network Extension, и macOS не даёт безопасного универсального способа управлять
+ею из system LaunchDaemon. Если поменял профиль в Happ, просто переподключи VPN.
+Если поменял стратегию zapret, выполни `sudo zaprctl use <strategy>` — роутер при
+этом менять не нужно.
 
 ---
 
@@ -81,9 +111,9 @@ So the interception core had to be rebuilt on primitives macOS does have.
 
 ```
                     ┌──────────────────────────────────────────────┐
-   application  ──► │ pf: pass out quick route-to (utun9 …) no state│ ──► our utun fd
-                    └──────────────────────────────────────────────┘      (interception
-                                                                           + drop verdict)
+   application  ──► │ pf: block out log ... quick on en0           │ ──► /dev/bpfN
+                    └──────────────────────────────────────────────┘      (DLT_PFLOG;
+                                                                           original dropped)
                                           │
                             desync engine │ split / fake / seqovl / ttl / ip-id
                                           ▼
@@ -95,9 +125,9 @@ So the interception core had to be rebuilt on primitives macOS does have.
                               (inbound is never steered: no userspace TCP stack)
 ```
 
-**`divert` — the packet datapath.** A pf rule steers the strategy's port window into a utun the daemon owns: reading a packet from that descriptor **is** the interception, and not re-emitting it **is** the drop verdict. Packets go back out as raw Ethernet frames written to `/dev/bpfN`, which bypasses pf entirely — so there is no loop, and every byte is ours: TCP sequence numbers (so `seqovl` works), per-packet TTL, `ip.id`, deliberately bad checksums, TCP options. Inbound traffic is never intercepted, so no userspace TCP stack is needed and the application's real 4-tuple is preserved.
+**`divert` — the packet datapath.** A pf rule logs matching outbound packets to a dedicated `pflog` interface and blocks the originals. The daemon reads DLT_PFLOG records, applies the strategy, then emits raw Ethernet frames through `/dev/bpfN`, below pf. There is no reinjection loop, while TCP sequence numbers, per-packet TTL, `ip.id`, deliberately bad checksums and TCP options remain under our control. Inbound traffic stays on the kernel socket path and the application's real 4-tuple is preserved.
 
-> **`divert` — пакетный датапас.** Правило pf заворачивает окно портов стратегии в utun, которым владеет демон: чтение пакета из этого дескриптора **и есть** перехват, а решение не переслать его — **и есть** дроп. Обратно пакеты уходят сырыми Ethernet-кадрами в `/dev/bpfN`, минуя pf — поэтому нет петли, и каждый байт наш: номера последовательности TCP (значит работает `seqovl`), TTL на каждый пакет, `ip.id`, намеренно битые контрольные суммы, TCP-опции. Входящий трафик не перехватывается вообще, поэтому не нужен userspace TCP-стек и сохраняется настоящий 4-tuple приложения.
+> **`divert` — пакетный датапас.** PF логирует подходящие исходящие пакеты в отдельный `pflog` и блокирует оригиналы. Демон читает DLT_PFLOG, применяет стратегию и выпускает сырые Ethernet-кадры через `/dev/bpfN` ниже PF. Петли повторного перехвата нет; доступны TCP sequence, TTL на каждый пакет, `ip.id`, намеренно битые checksums и TCP options. Ответы сервера остаются на штатном пути ядра, настоящий 4-tuple приложения сохраняется.
 
 **`proxy` — the fallback.** `pf rdr` to a local listener plus `ioctl(DIOCNATLOOK)` to recover the original destination — the way zapret's `tpws` works on macOS. TCP only, byte-level tricks only: `send()` boundaries, `tlsrec`, `tamper`, disorder via TTL 1. No `fake`, no `seqovl`, no UDP.
 
@@ -111,19 +141,16 @@ So the interception core had to be rebuilt on primitives macOS does have.
 
 ## Verified on real hardware / Проверено на живом железе
 
-`zapret-probe` answers, on your machine, whether the packet datapath is possible at all — and it reverts every change it makes. On the development machine (macOS 26.5.1, Apple Silicon, SIP enabled) all ten stages pass:
+The live `TestLivePFLogIntercept` integration test was run on the target Apple Silicon Mac with SIP enabled. It observed the blocked SYN on `pflog9`, parsed the aligned DLT_PFLOG header and re-injected the IPv4 packet through the physical interface:
 
-> `zapret-probe` отвечает на вопрос, возможен ли пакетный датапас именно на вашей машине, и откатывает все свои изменения. На машине разработки (macOS 26.5.1, Apple Silicon, SIP включён) проходят все десять стадий:
+> Live-тест `TestLivePFLogIntercept` пройден на целевом Apple Silicon Mac с включённым SIP: заблокированный SYN пришёл на `pflog9`, DLT_PFLOG был разобран, а IPv4-пакет повторно выпущен через физический интерфейс.
 
 | Property | Evidence |
 |---|---|
-| `route-to` delivers an outbound segment to our utun | SYN read off `utun9` with the `{0,0,0,2}` prefix |
-| Packets need no checksum repair | IPv4 and TCP checksums already correct on arrival |
-| A BPF write reaches the NIC and completes the flow | frame seen by a second reader, the TCP dial **completed** |
-| `--ip-id=zero` survives on the BPF path | `egress_frame_ip_id: 0x0000` |
-| `--ip-id=zero` is impossible via `SOCK_RAW` | kernel rewrote `ip_id 0` → `0xf7a0` |
-| `DIOCNATLOOK` recovers the original destination | returned the exact target address and port |
-| `/etc/pf.conf` untouched | same SHA-256 and mtime before and after |
+| PF log/drop interception | blocked outbound SYN captured on `pflog9` |
+| DLT_PFLOG parsing | IP payload found at the required word-aligned offset |
+| BPF re-injection | captured IPv4 packet emitted through `en0` |
+| `/etc/pf.conf` untouched | rules loaded below the stock `com.apple/*` wildcard |
 
 ---
 
@@ -157,15 +184,22 @@ The CLI never hides this: `zaprctl list` marks, per strategy, exactly which ops 
 zaprctl status                  # transport, strategy, counters, pf state, warnings
 zaprctl list                    # strategies + what the transport cannot honour
 zaprctl explain general         # compiled profiles: filters, ops, real parameters
-sudo zaprctl use general-alt3   # switch strategy
-zaprctl autopick                # measure every strategy, keep the best
-zaprctl test                    # connectivity self-test through the datapath
+sudo zaprctl use cloud-gaming   # Discord + YouTube + cloud-gaming default
+zaprctl autopick --suite discord --no-early-stop --rounds 3
+zaprctl test --suite discord    # API, WSS, CDN, updater and UDP/STUN
 zaprctl doctor [--repair]       # diagnostics; fixes what is safely ours
 sudo zaprctl vpn stop|start     # the VPN that blocks the packet datapath
+zaprctl router happ --install   # проверка Happ + импорт split-routing профиля
+zaprctl autostart install      # запуск Happ и watcher списков при входе в систему
+sudo zaprctl probe               # capability probe, встроенный в этот CLI
 sudo zaprctl hosts apply        # /etc/hosts pinning for Discord voice
 sudo zaprctl ipset any          # upstream's tri-state ipset switch
 zaprctl logs -f
 ```
+
+Run `test` and `autopick` **without `sudo`**. The default PF rules exempt root
+traffic, so root-owned probes bypass zapret and can give a false failure or
+select the wrong strategy. The control socket grants access to the `admin` group.
 
 > Те же команды по-русски: `status` — транспорт, стратегия, счётчики, состояние pf и предупреждения; `list` — стратегии и что из них не потянет активный транспорт; `explain` — скомпилированные профили с реальными параметрами (замена чтению `.bat`); `use` — сменить стратегию; `autopick` — перебрать все и оставить рабочую; `test` — проверка связности через датапас; `doctor` — диагностика и починка своего мусора; `vpn stop/start` — корректно остановить и вернуть VPN; `hosts apply` — пины IP для Discord voice; `ipset` — tri-state переключатель из upstream; `logs` — журнал демона.
 
@@ -173,15 +207,16 @@ zaprctl logs -f
 
 ## If something breaks / Если что-то сломалось
 
-One command always restores normal networking — it empties only our own pf anchor:
+One command always restores normal networking. It resolves the effective
+`com.apple/zapret-mac` sub-anchor (or the pf.conf fallback) and empties it:
 
 ```bash
-sudo pfctl -a zapret-mac -F all
+sudo /usr/local/libexec/zapretd guard --verbose
 ```
 
 A `launchd` guard does this automatically every 5 seconds whenever no daemon owns the anchor, so a `kill -9` cannot leave pf dropping your traffic.
 
-> Одна команда всегда возвращает сеть в норму — она очищает только наш собственный pf-анкор: `sudo pfctl -a zapret-mac -F all`. Раз в 5 секунд то же самое делает автоматически launchd-страж, если анкором никто не владеет, поэтому `kill -9` не может оставить pf дропающим ваш трафик.
+> Одна команда всегда возвращает сеть в норму и сама находит фактический PF-анкор: `sudo /usr/local/libexec/zapretd guard --verbose`. Раз в 5 секунд то же делает launchd-страж, если анкором никто не владеет.
 
 Full uninstall: `make uninstall` — removes the binaries, both launchd jobs and the `/etc/hosts` block if it was applied.
 
@@ -191,15 +226,15 @@ Full uninstall: `make uninstall` — removes the binaries, both launchd jobs and
 
 ## Known limitations / Известные ограничения
 
-* Traffic from **root-owned** processes is not bypassed — the `user { > root }` rule is the loop breaker for our own injected packets. `tpws` on macOS has the same limitation.
+* Root-owned traffic is intentionally exempt from interception via `user { > root }`. This is the loop breaker for injected packets and lets Happ's own VPN transport reach its server while user-owned Direct connections are processed.
 * Internet Sharing is not supported.
-* A full-tunnel VPN makes the whole thing pointless; the daemon refuses to start the packet datapath while one holds the default route (`--allow-vpn` overrides).
+* A blind full-tunnel VPN makes direct desync impossible because its sockets carry tunnel addresses. With the Happ split-routing profile (`zaprctl router happ --install`), `--allow-vpn` lets zapret process physical Direct connections while foreign traffic remains tunneled.
 * Apple documents pf as "not API" ([TN3165](https://developer.apple.com/documentation/technotes/tn3165-packet-filter-is-not-api)) and there is no arbitration between tools. The daemon watches its anchor for drift and reloads, but a conflict with something else running `pfctl -f /etc/pf.conf` is possible by design.
 * Strategies decay: `seqovl=681` works only while the DPI reassembles naively. `cmd/batconv` re-imports upstream at any time.
 
-> * Трафик процессов, запущенных от **root**, не обходится — правило `user { > root }` разрывает петлю для наших же инжектированных пакетов; ровно то же ограничение у `tpws` на macOS.
+> * Трафик процессов, запущенных от **root**, намеренно исключён из перехвата правилом `user { > root }`. Это разрывает петлю инжекции и позволяет собственному VPN-трафику Happ доходить до сервера, пока пользовательские Direct-соединения обрабатываются zapret.
 > * Internet Sharing не поддерживается.
-> * При полнотуннельном VPN всё это бессмысленно: демон отказывается поднимать пакетный датапас, пока VPN держит маршрут по умолчанию (обходится флагом `--allow-vpn`).
+> * При слепом полнотуннельном VPN десинхронизация невозможна: сокеты несут адрес туннеля. В split-routing профиле (`zaprctl router happ --install` для Happ) `--allow-vpn` позволяет zapret обрабатывать физические Direct-соединения, а иностранный трафик оставляет в VPN.
 > * Apple документирует pf как «не API» ([TN3165](https://developer.apple.com/documentation/technotes/tn3165-packet-filter-is-not-api)), арбитража между инструментами не существует. Демон следит за дрейфом своего анкора и восстанавливает его, но конфликт с чем-то, что делает `pfctl -f /etc/pf.conf`, возможен принципиально.
 > * Стратегии деградируют: `seqovl=681` работает, пока DPI собирает поток наивно. `cmd/batconv` в любой момент перечитывает upstream.
 
@@ -214,7 +249,7 @@ Everything that is unverified, approximated or deliberately unimplemented is wri
 ```
 cmd/zapretd            root daemon: launchd, supervisor, journal-based rollback
 cmd/zaprctl            CLI over the unix socket /var/run/zapret-mac.sock
-cmd/zapret-probe       standalone capability probe (needs root, reverts itself)
+cmd/zaprctl/probe.go   embedded capability probe (`zaprctl probe`, needs root)
 cmd/batconv            converter: upstream .bat strategies → TOML
 internal/proto         IPv4/IPv6/TCP/UDP, checksums, fragmentation, TLS ClientHello,
                        split-position markers, QUIC Initial decryption → SNI,
@@ -225,11 +260,11 @@ internal/desync        techniques: multisplit, multidisorder, fakedsplit, fakedd
 internal/engine        profile selection, flow state, cutoff/start, autottl, Caps gating
 internal/strategy      TOML strategy loader and compiler
 internal/lists         hostlists (suffix matching) and ipsets (32k CIDRs)
-internal/transport     divert (utun + BPF) and proxy (pf rdr + DIOCNATLOOK)
+internal/transport     divert (pflog + BPF) and proxy (pf rdr + DIOCNATLOOK)
 internal/netcfg        pf: token, wildcard sub-anchor, tables, rollback journal
 internal/vpn           detect and cleanly stop VPN software holding the default route
 internal/diag          capability detection, doctor, self-test, strategy autopick
-strategies/*.toml      21 strategies converted from upstream
+strategies/*.toml      21 upstream strategies + cloud-gaming integration profile
 lists/, fakes/         domain/CIDR lists and fake payloads from upstream
 ```
 

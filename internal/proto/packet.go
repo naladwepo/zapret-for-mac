@@ -112,8 +112,14 @@ func parseV4(raw []byte) (*Pkt, error) {
 	switch {
 	case total == 0:
 		// TCP segmentation offload leaves ip_len zero on locally generated
-		// packets; the buffer length is then the only truth we have.
+		// packets; the buffer length is then the only truth we have. Fill the
+		// header too: the divert transport writes this packet below the IP
+		// stack, where no driver will supply the missing length for us.
+		if len(raw) > 0xffff {
+			return nil, fmt.Errorf("%w: ipv4 offload packet length %d exceeds 65535", ErrMalformedHeader, len(raw))
+		}
 		total = len(raw)
+		binary.BigEndian.PutUint16(raw[2:4], uint16(total))
 	case total < ihl:
 		return nil, fmt.Errorf("%w: ipv4 total length %d < ihl %d", ErrMalformedHeader, total, ihl)
 	case total > len(raw):
@@ -151,8 +157,14 @@ func parseV6(raw []byte) (*Pkt, error) {
 	total := ipv6FixedHdrLen + plen
 	switch {
 	case plen == 0:
-		// Jumbogram (hop-by-hop option) or offload: trust the buffer.
+		// A zero length can mean a jumbogram (hop-by-hop option) or local
+		// offload. Only a bare TCP/UDP packet is safe to normalise here;
+		// jumbograms must retain their zero payload-length field.
 		total = len(raw)
+		if len(raw) <= ipv6FixedHdrLen+0xffff &&
+			(raw[6] == IPProtoTCP || raw[6] == IPProtoUDP) {
+			binary.BigEndian.PutUint16(raw[4:6], uint16(len(raw)-ipv6FixedHdrLen))
+		}
 	case total > len(raw):
 		return nil, fmt.Errorf("%w: ipv6 payload length %d, have %d", ErrTruncated, plen, len(raw)-ipv6FixedHdrLen)
 	}

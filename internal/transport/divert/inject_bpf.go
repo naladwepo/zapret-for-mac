@@ -96,6 +96,12 @@ type bpfHandle struct {
 // locally transmitted frames are also captured; the observer sets it to false so
 // it never sees its own injections.
 func openBPF(iface string, bufLen int, hdrComplete, seeSent bool, filter []unix.BpfInsn) (*bpfHandle, error) {
+	return openBPFWithDLT(iface, bufLen, hdrComplete, seeSent, filter, dltEN10MB)
+}
+
+// openBPFWithDLT is openBPF with an explicit link type.  The packet injector
+// and observer use Ethernet; the pflog interceptor uses DLT_PFLOG.
+func openBPFWithDLT(iface string, bufLen int, hdrComplete, seeSent bool, filter []unix.BpfInsn, wantDLT int) (*bpfHandle, error) {
 	if iface == "" {
 		return nil, fmt.Errorf("divert: openBPF needs an interface name")
 	}
@@ -117,7 +123,7 @@ scan:
 			continue
 		}
 		h := &bpfHandle{fd: fd, Device: dev, Iface: iface, BufLen: bufLen}
-		if err := h.setup(hdrComplete, seeSent, filter); err != nil {
+		if err := h.setup(hdrComplete, seeSent, filter, wantDLT); err != nil {
 			unix.Close(fd)
 			h.fd = -1
 			return nil, err
@@ -132,7 +138,7 @@ scan:
 
 // setup applies the descriptor options in the order the kernel requires: the
 // buffer length must be set before the interface is attached.
-func (h *bpfHandle) setup(hdrComplete, seeSent bool, filter []unix.BpfInsn) error {
+func (h *bpfHandle) setup(hdrComplete, seeSent bool, filter []unix.BpfInsn, wantDLT int) error {
 	blen := int32(h.BufLen)
 	if err := ioctlPtr(h.fd, biocSBlen, unsafe.Pointer(&blen)); err != nil {
 		return syscallError("ioctl(BIOCSBLEN)", err)
@@ -172,9 +178,8 @@ func (h *bpfHandle) setup(hdrComplete, seeSent bool, filter []unix.BpfInsn) erro
 		return syscallError("ioctl(BIOCGDLT)", err)
 	}
 	h.Datalink = int(dlt)
-	if h.Datalink != dltEN10MB {
-		return fmt.Errorf("divert: %s has link type %d, not Ethernet (DLT_EN10MB=%d); "+
-			"a raw Ethernet write is impossible there", h.Iface, h.Datalink, dltEN10MB)
+	if h.Datalink != wantDLT {
+		return fmt.Errorf("divert: %s has link type %d, want %d", h.Iface, h.Datalink, wantDLT)
 	}
 	if err := unix.SetNonblock(h.fd, true); err != nil {
 		return syscallError("SetNonblock(bpf)", err)

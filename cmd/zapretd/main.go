@@ -49,6 +49,11 @@ const DefaultDataDir = "/Library/Application Support/zapret-mac"
 // DefaultAnchor is the pf anchor the daemon owns exclusively.
 const DefaultAnchor = "zapret-mac"
 
+// DefaultStrategy is the known-good combined Discord, YouTube and cloud-gaming
+// profile. It is used only when neither --strategy nor persisted state names a
+// strategy, so `zaprctl use` remains persistent across daemon restarts.
+const DefaultStrategy = "cloud-gaming"
+
 // Default point-to-point addresses of the steering utun. 198.18.0.0/15 is
 // RFC 2544 benchmark space: it is not globally routed, so it cannot collide with
 // a real destination, and it is not in the RFC 1918 ranges a VPN or a home
@@ -108,14 +113,14 @@ func defaultOptions() options {
 // into the plist.
 func (o *options) bind(fs *flag.FlagSet) {
 	fs.StringVar(&o.dataDir, "data", o.dataDir, "data directory holding strategies/, lists/, fakes/ and state/")
-	fs.StringVar(&o.strategy, "strategy", o.strategy, "strategy name or path to a .toml (default: the last one activated, else \"general\")")
+	fs.StringVar(&o.strategy, "strategy", o.strategy, "strategy name or path to a .toml (default: the last one activated, else \"cloud-gaming\")")
 	fs.StringVar(&o.transport, "transport", o.transport, "datapath: auto|divert|proxy")
 	fs.IntVar(&o.proxyPort, "proxy-port", o.proxyPort, "loopback port for the proxy transport")
 	fs.IntVar(&o.utunUnit, "utun-unit", o.utunUnit, "utun unit number for the divert transport (0 = first free)")
 	fs.StringVar(&o.iface, "iface", o.iface, "physical uplink for packet re-emission (empty = from the default route)")
 	fs.BoolVar(&o.blockQUIC, "block-quic", o.blockQUIC, "drop UDP/443 to the target set, forcing browsers back to TCP")
-	fs.BoolVar(&o.noExemptRoot, "no-exempt-root", o.noExemptRoot, "steer root-owned traffic too (loses the loop breaker; needed to test with curl as root)")
-	fs.BoolVar(&o.allowVPN, "allow-vpn", o.allowVPN, "start the packet datapath even while a VPN holds the default route (it will break connectivity: packets carry the tunnel's source address)")
+	fs.BoolVar(&o.noExemptRoot, "no-exempt-root", o.noExemptRoot, "also intercept root-owned direct sockets (required for VPN clients such as Happ; BPF injection remains loop-free)")
+	fs.BoolVar(&o.allowVPN, "allow-vpn", o.allowVPN, "run beside a split-routing VPN (direct targets must leave through the physical uplink)")
 	fs.IntVar(&o.verbose, "verbose", o.verbose, "log level: 0 quiet, 1 debug, 2 packet trace")
 	fs.BoolVar(&o.foreground, "foreground", o.foreground, "run in this terminal instead of under launchd")
 	fs.StringVar(&o.socketPath, "socket", o.socketPath, "control socket path")

@@ -632,6 +632,8 @@ func TestProbeKind(t *testing.T) {
 	cases := map[string]string{
 		"https://x/":      "https",
 		"tls://x:443":     "tls",
+		"wss://x/socket":  "wss",
+		"stun://x:19302":  "stun",
 		"ping://1.1.1.1":  "tcp",
 		"http://x/":       "https",
 		"nonsense-string": "https",
@@ -639,6 +641,26 @@ func TestProbeKind(t *testing.T) {
 	for url, want := range cases {
 		if got := (Probe{URL: url}).Kind(); got != want {
 			t.Errorf("Kind(%q) = %q, want %q", url, got, want)
+		}
+	}
+}
+
+func TestDiscordProbesCoverAppAndVoicePaths(t *testing.T) {
+	probes := DiscordProbes()
+	kinds := map[string]bool{}
+	all := ""
+	for _, p := range probes {
+		kinds[p.Kind()] = true
+		all += p.URL + " "
+	}
+	for _, kind := range []string{"https", "wss", "stun"} {
+		if !kinds[kind] {
+			t.Errorf("DiscordProbes has no %s probe", kind)
+		}
+	}
+	for _, host := range []string{"discord.com", "gateway.discord.gg", "cdn.discordapp.com", "updates.discord.com"} {
+		if !strings.Contains(all, host) {
+			t.Errorf("DiscordProbes does not cover %s", host)
 		}
 	}
 }
@@ -2316,7 +2338,7 @@ func TestPickRestoresOriginalWhenNothingWorks(t *testing.T) {
 	}
 }
 
-func TestPickStopsWhenControlProbesFail(t *testing.T) {
+func TestPickContinuesWhenControlProbesFail(t *testing.T) {
 	client := &stubClient{active: "general"}
 	res, err := Pick(context.Background(), PickOpts{
 		Strategies: stubStrategies("a", "b", "c"),
@@ -2332,10 +2354,10 @@ func TestPickStopsWhenControlProbesFail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
-	// With no working internet, blaming twenty strategies is worse than stopping
-	// after the first invalid measurement.
-	if res.Tested != 1 {
-		t.Fatalf("Tested = %d, want 1: an invalid measurement must abort the sweep", res.Tested)
+	// One transient control failure must not leave every remaining candidate as
+	// a misleading 0/0 row.
+	if res.Tested != 3 {
+		t.Fatalf("Tested = %d, want 3: invalid candidates must be excluded without aborting the sweep", res.Tested)
 	}
 	if !res.Restored {
 		t.Fatal("the original strategy must be restored")

@@ -196,10 +196,10 @@ func TestHostSetLoadRealLists(t *testing.T) {
 	if err := es.LoadFile(exclude); err != nil {
 		t.Fatalf("LoadFile(list-exclude.txt): %v", err)
 	}
-	if got := es.Len(); got != 112 {
-		t.Errorf("list-exclude.txt Len = %d, want 112", got)
+	if got := es.Len(); got != 126 {
+		t.Errorf("list-exclude.txt Len = %d, want 126", got)
 	}
-	for _, h := range []string{"mail.ru", "www.yandex.ru", "twitch.tv", "ya.ru"} {
+	for _, h := range []string{"mail.ru", "www.yandex.ru", "twitch.tv", "ya.ru", "vkplay.ru", "vkplay.live", "userapi.com"} {
 		if !es.Match(h) {
 			t.Errorf("list-exclude: Match(%q) = false, want true", h)
 		}

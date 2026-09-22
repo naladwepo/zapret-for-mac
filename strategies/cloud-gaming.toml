@@ -1,0 +1,207 @@
+# macOS pflog profile: Flowseal general (ALT3) + Game Filter (TCP+UDP).
+# High ports are still constrained by ipset-all.txt, matching Flowseal's
+# "Game Filter: all" mode; do not combine this with `zaprctl ipset any`.
+
+name = "cloud-gaming"
+description = "Flowseal general ALT3, selected by live Discord API/WSS/STUN tests, with Game Filter enabled."
+source = "general (ALT3).bat"
+
+[window]
+tcp = ["80", "443", "1024-65535"]
+udp = ["443", "1024-65535"]
+
+[[profile]]
+name = "p1-udp-443"
+
+[profile.filter]
+proto = "udp"
+ports = ["443"]
+hostlist = ["list-general.txt", "list-general-user.txt"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+repeats = 6
+
+[profile.ops.fake]
+quic = "quic_initial_www_google_com.bin"
+
+[[profile]]
+name = "p2-udp-19294-19344_50000-50100"
+
+[profile.filter]
+proto = "udp"
+ports = ["19294-19344", "50000-50100"]
+l7 = ["discord", "stun"]
+
+[[profile.ops]]
+op = "fake"
+repeats = 6
+
+[profile.ops.fake]
+discord = ["ACTIVE_DISCORD_UDP.bin"]
+stun = ["ACTIVE_DISCORD_UDP.bin"]
+
+[[profile]]
+name = "p3-tcp-2053_2083_2087_2096_8443"
+
+[profile.filter]
+proto = "tcp"
+ports = ["2053", "2083", "2087", "2096", "8443"]
+hostlist_domains = ["discord.media"]
+
+[[profile.ops]]
+op = "fake"
+fooling = ["ts"]
+tls_mod = "rnd,dupsid,sni=www.google.com"
+
+[[profile.ops]]
+op = "hostfakesplit"
+fooling = ["ts"]
+
+[profile.ops.mod]
+altorder = "1"
+host = "www.google.com"
+
+[[profile]]
+name = "p4-tcp-443"
+
+[profile.filter]
+proto = "tcp"
+ports = ["443"]
+hostlist = ["list-google.txt"]
+
+[[profile.ops]]
+op = "fake"
+fooling = ["ts"]
+tls_mod = "rnd,dupsid,sni=www.google.com"
+
+[[profile.ops]]
+op = "hostfakesplit"
+fooling = ["ts"]
+
+[profile.ops.mod]
+altorder = "1"
+host = "www.google.com"
+
+[[profile.ops]]
+op = "ip_id"
+mode = "zero"
+
+[[profile]]
+name = "p5-tcp-80_443"
+
+[profile.filter]
+proto = "tcp"
+ports = ["80", "443"]
+hostlist = ["list-general.txt", "list-general-user.txt"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+fooling = ["ts"]
+tls_mod = "rnd,dupsid,sni=ya.ru"
+
+[profile.ops.fake]
+http = "tls_clienthello_max_ru.bin"
+
+[[profile.ops]]
+op = "hostfakesplit"
+fooling = ["ts"]
+
+[profile.ops.mod]
+altorder = "1"
+host = "ya.ru"
+
+[[profile]]
+name = "p6-udp-443"
+
+[profile.filter]
+proto = "udp"
+ports = ["443"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset = ["ipset-all.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+repeats = 6
+
+[profile.ops.fake]
+quic = "quic_initial_www_google_com.bin"
+
+[[profile]]
+name = "p7-tcp-80_443_8443"
+
+[profile.filter]
+proto = "tcp"
+ports = ["80", "443", "8443"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset = ["ipset-all.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+fooling = ["ts"]
+tls_mod = "rnd,dupsid,sni=ya.ru"
+
+[profile.ops.fake]
+http = "tls_clienthello_max_ru.bin"
+
+[[profile.ops]]
+op = "hostfakesplit"
+fooling = ["ts"]
+
+[profile.ops.mod]
+altorder = "1"
+host = "ya.ru"
+
+[[profile]]
+name = "p8-game-tcp"
+cutoff = "n4"
+
+[profile.filter]
+proto = "tcp"
+ports = ["1024-65535"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset = ["ipset-all.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+fooling = ["ts"]
+tls_mod = "rnd,dupsid,sni=ya.ru"
+any_protocol = true
+
+[profile.ops.fake]
+http = "tls_clienthello_max_ru.bin"
+
+[[profile.ops]]
+op = "hostfakesplit"
+fooling = ["ts"]
+any_protocol = true
+
+[profile.ops.mod]
+altorder = "1"
+host = "ya.ru"
+
+[[profile]]
+name = "p9-game-udp"
+cutoff = "n4"
+
+[profile.filter]
+proto = "udp"
+ports = ["1024-65535"]
+hostlist_exclude = ["list-exclude.txt", "list-exclude-user.txt", "list-vk.txt"]
+ipset = ["ipset-all.txt"]
+ipset_exclude = ["ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+[[profile.ops]]
+op = "fake"
+repeats = 10
+any_protocol = true
+
+[profile.ops.fake]
+unknown_udp = ["ACTIVE_GAME_UDP.bin"]

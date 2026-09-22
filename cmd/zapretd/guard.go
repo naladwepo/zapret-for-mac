@@ -18,17 +18,10 @@ import (
 
 // The dead-man's switch.
 //
-// THE HAZARD. The divert transport's steering rule is
-//
-//	pass out quick route-to (utunN 198.18.0.2) inet proto tcp ... no state
-//
-// A utun exists only while its kernel-control socket is open, so the interface
-// dies with the daemon's process — but the pf rules do not. xnu's pf_route() sends
-// a packet whose route-to interface has no ifp to `bad:` and m_freem()s it, so the
-// packet is DROPPED, not passed. A `kill -9` on the daemon therefore black-holes
-// every outbound TCP connection on the strategy's port window (and its UDP window)
-// until something flushes the anchor. `sudo zapretd --foreground` killed with -9
-// has no automatic recovery path at all: there is no launchd job to restart.
+// THE HAZARD. The pflog transport deliberately blocks matching originals after
+// logging them, then re-injects the transformed packets through BPF. If the
+// process dies after installing those rules, the originals remain blocked until
+// something flushes the anchor.
 //
 // THE SWITCH. `zapretd guard` is a one-shot command that:
 //
@@ -46,7 +39,7 @@ import (
 // It is also safe to run by hand, which is the documented manual recovery:
 //
 //	sudo zapretd guard --verbose
-//	sudo pfctl -a zapret-mac -F all      # the same thing without this binary
+//	sudo pfctl -a com.apple/zapret-mac -F all # stock pf.conf wildcard mode
 
 // runGuard implements the `guard` subcommand.
 func runGuard(args []string, stdout, stderr io.Writer) int {
@@ -112,28 +105,33 @@ func runGuard(args []string, stdout, stderr io.Writer) int {
 		Logf:       logf,
 	})
 	defer pf.Close()
+	if _, err := pf.ResolveAnchor(); err != nil {
+		fmt.Fprintf(stderr, "zapretd guard: resolving anchor %q failed: %v\n", opts.anchor, err)
+		return exitError
+	}
+	effectiveAnchor := pf.EffectiveAnchor()
 
 	rules, rerr := pf.Rules()
 	nat, nerr := pf.NatRules()
 	if rerr != nil && nerr != nil {
 		// pf is probably disabled, which means nothing of ours can be dropping
 		// packets. Not an error worth waking anybody for.
-		logf("cannot read anchor %q (%v); pf is most likely disabled", opts.anchor, rerr)
+		logf("cannot read anchor %q (%v); pf is most likely disabled", effectiveAnchor, rerr)
 		return exitOK
 	}
 	if strings.TrimSpace(rules) == "" && strings.TrimSpace(nat) == "" {
-		logf("no daemon and an empty anchor %q: nothing to do", opts.anchor)
+		logf("no daemon and an empty anchor %q: nothing to do", effectiveAnchor)
 		return exitOK
 	}
 
 	// Step 3: orphaned rules. THIS is the black hole — flush it.
 	fmt.Fprintf(stdout, "zapretd guard: anchor %q still holds %d filter and %d translation rule(s) but no daemon "+
 		"owns it; flushing so pf stops dropping the port window\n",
-		opts.anchor, countRuleLines(rules), countRuleLines(nat))
+		effectiveAnchor, countRuleLines(rules), countRuleLines(nat))
 	code := exitOK
 	if err := pf.FlushRules(); err != nil {
 		fmt.Fprintf(stderr, "zapretd guard: flushing anchor %q failed: %v\n"+
-			"  run this by hand NOW: sudo pfctl -a %s -F all\n", opts.anchor, err, opts.anchor)
+			"  run this by hand NOW: sudo pfctl -a %s -F all\n", effectiveAnchor, err, effectiveAnchor)
 		code = exitError
 	}
 	// The orphaned `pfctl -E` reference keeps pf enabled for the rest of uptime;

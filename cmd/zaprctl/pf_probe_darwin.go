@@ -27,12 +27,12 @@ const (
 	pfDevice   = "/dev/pf"
 
 	// probeAnchor is the anchor name the probe loads its rules into.
-	probeAnchor = "zapret-probe"
+	probeAnchor = "zapret-mac-probe"
 
 	// appleSubAnchor is a sub-anchor nested under the wildcard anchor point a
 	// stock /etc/pf.conf already declares. Loading rules here makes them live
 	// without editing /etc/pf.conf and without replacing the main ruleset.
-	appleSubAnchor = "com.apple/zapret-probe"
+	appleSubAnchor = "com.apple/zapret-mac-probe"
 	// zapretMacAnchor is the anchor the DAEMON owns. The probe never writes it; it
 	// only checks whether it holds rules, which is evidence that a daemon is live
 	// and that replacing the main ruleset would wipe its steering.
@@ -313,7 +313,7 @@ func pfRestoreMain() pfResult { return runPfctl("", "-f", pfConfPath) }
 // /etc/pf.conf carries `anchor "com.apple/*"` (and the nat/rdr/scrub variants),
 // and a trailing /* means "evaluate every sub-anchor nested at this point".
 // Sub-anchors are created purely by loading rules into them, so
-// `pfctl -a "com.apple/zapret-probe" -f -` produces rules pf actually evaluates
+// `pfctl -a "com.apple/zapret-mac-probe" -f -` produces rules pf actually evaluates
 // WITHOUT touching /etc/pf.conf and WITHOUT replacing the main ruleset — which
 // is exactly how Apple's own services (Internet Sharing NAT, AirDrop) get their
 // rules in at runtime.
@@ -352,7 +352,7 @@ func wildcardAnchorCovers(mainRules, sub string) bool {
 var anchorStatementRe = regexp.MustCompile(`^(anchor|rdr-anchor|nat-anchor|scrub-anchor|dummynet-anchor)\s`)
 
 // anchorReachableRe matches an anchor statement in "pfctl -s rules" output that
-// names our anchor, e.g. `anchor "zapret-probe" all`.
+// names our anchor, e.g. `anchor "zapret-mac-probe" all`.
 func anchorReachable(mainRules, anchor string) bool {
 	for _, line := range strings.Split(mainRules, "\n") {
 		l := strings.TrimSpace(line)
@@ -390,19 +390,19 @@ func spliceMainRuleset(pfConf string, translation, filter []string) string {
 			continue
 		}
 		if !inserted && filterSectionRe.MatchString(t) {
-			head = append(head, "# --- zapret-probe (temporary) ---")
+			head = append(head, "# --- zapret-mac-probe (temporary) ---")
 			head = append(head, translation...)
 			head = append(head, filter...)
-			head = append(head, "# --- end zapret-probe ---")
+			head = append(head, "# --- end zapret-mac-probe ---")
 			inserted = true
 		}
 		head = append(head, line)
 	}
 	if !inserted {
-		head = append(head, "# --- zapret-probe (temporary) ---")
+		head = append(head, "# --- zapret-mac-probe (temporary) ---")
 		head = append(head, translation...)
 		head = append(head, filter...)
-		head = append(head, "# --- end zapret-probe ---")
+		head = append(head, "# --- end zapret-mac-probe ---")
 	}
 	head = append(head, loads...)
 	return strings.Join(head, "\n") + "\n"

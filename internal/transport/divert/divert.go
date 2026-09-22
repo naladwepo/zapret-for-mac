@@ -168,7 +168,8 @@ type Transport struct {
 	strat *strategy.Strategy
 	route netcfg.Route
 	mtu   int
-	utun  *utunHandle
+	utun  *utunHandle // legacy field kept for on-disk/API compatibility; unused by pflog transport
+	plog  *pflogHandle
 	inj   injector
 	obs   *observer
 	pf    *netcfg.PF
@@ -350,47 +351,20 @@ func (t *Transport) setup(ctx context.Context) error {
 	t.opts.Logf("divert: uplink %s, local %s, gateway %s, mac %s, mtu %d",
 		route.Iface, route.Local, route.Gateway, route.MAC, mtu)
 
-	// 2. Create the utun. Its MTU is the uplink's MINUS the headroom every
-	// header-inserting op can need, because we re-emit with a raw link-layer
-	// write and therefore get no kernel fragmentation. On IPv6 nothing can be
-	// fragmented after the fact (fragmentForMTU is IPv4-only), so a full-size
-	// packet plus a Fragment header (8) plus two hop-by-hop headers (16) would be
-	// handed to bpfwrite oversize and rejected with EMSGSIZE — losing the payload,
-	// because the plan has already claimed the original. Capping the utun instead
-	// makes the application produce packets that still fit after insertion.
+	// 2. Create a dedicated pflog interface. PF will log the packet there and
+	// block the original; unlike route-to/utun, this works on current Tahoe
+	// kernels where steering to a utun is silently ignored.
 	if err := t.stopRequested(); err != nil {
 		return err
 	}
-	local, peer, err := t.tunPair()
-	if err != nil {
-		return err
-	}
-	tunMTU := mtu - injectHeadroom
-	if tunMTU < minTunMTU {
-		tunMTU = minTunMTU
-	}
-	utun, err := createUTUN(t.cfg.UtunUnit, local, peer, tunMTU)
+	plog, err := createPFLog()
 	if err != nil {
 		return err
 	}
 	t.mu.Lock()
-	t.utun = utun
+	t.plog = plog
 	t.mu.Unlock()
-	for _, n := range utun.Notes {
-		t.warn("utun configuration: %s", n)
-	}
-	if utun.FellBack {
-		t.opts.Logf("divert: utun unit %d was unavailable, kernel assigned %s", t.cfg.UtunUnit, utun.Name)
-	}
-	t.opts.Logf("divert: %s up, %s -> %s/32, mtu %d", utun.Name, utun.Local, utun.Peer, utun.MTU)
-	if t.opts.IPv6 {
-		l6, p6 := t.tunPair6()
-		if err := utun.ConfigureIPv6(l6, p6); err != nil {
-			t.warn("IPv6 steering disabled: %v", err)
-		} else {
-			t.opts.Logf("divert: %s also carries %s -> %s/128", utun.Name, l6, p6)
-		}
-	}
+	t.opts.Logf("divert: interception through %s (DLT_PFLOG)", plog.Name())
 
 	if err := t.stopRequested(); err != nil {
 		return err
@@ -651,13 +625,13 @@ func (t *Transport) syncTable(pf *netcfg.PF, name string, prefixes []netip.Prefi
 // steerRules renders the anchor ruleset for the active strategy's port window.
 func (t *Transport) steerRules() (string, error) {
 	t.mu.Lock()
-	strat, utun, inj := t.strat, t.utun, t.inj
+	strat, plog, utun, inj := t.strat, t.plog, t.utun, t.inj
 	t.mu.Unlock()
 	if strat == nil {
 		return "", errors.New("divert: no strategy loaded")
 	}
-	if utun == nil {
-		return "", errors.New("divert: the utun is not up yet")
+	if plog == nil && utun == nil {
+		return "", errors.New("divert: no packet interceptor is up yet")
 	}
 
 	exemptRoot := t.cfg.ExemptRoot
@@ -676,23 +650,36 @@ func (t *Transport) steerRules() (string, error) {
 			"window port will be steered into its own datapath")
 	}
 
-	o := netcfg.SteerOpts{
-		Utun:         utun.Name,
-		TunPeer:      utun.Peer.String(),
+	if plog == nil {
+		o := netcfg.SteerOpts{
+			Utun: utun.Name, TunPeer: utun.Peer.String(),
+			TCPPorts: portRanges(strat.WindowTCP), UDPPorts: portRanges(strat.WindowUDP),
+			ExcludeTable: t.opts.ExcludeTable, TargetTable: t.opts.TargetTable,
+			ExemptRoot: exemptRoot, BlockQUIC: t.cfg.BlockQUIC,
+		}
+		rules := netcfg.SteerRules(o)
+		if t.opts.IPv6 && utun.HaveIPv6 {
+			o6 := o
+			o6.IPv6, o6.TunPeer6, o6.NoLoopbackPass = true, utun.Peer6.String(), true
+			rules = mergeRulesets(rules, netcfg.SteerRules(o6))
+		}
+		return rules, nil
+	}
+
+	o := netcfg.LogDropOpts{
+		PFLog:        plog.Name(),
+		Iface:        t.route.Iface,
 		TCPPorts:     portRanges(strat.WindowTCP),
 		UDPPorts:     portRanges(strat.WindowUDP),
 		ExcludeTable: t.opts.ExcludeTable,
 		TargetTable:  t.opts.TargetTable,
 		ExemptRoot:   exemptRoot,
-		BlockQUIC:    t.cfg.BlockQUIC,
 	}
-	rules := netcfg.SteerRules(o)
-	if t.opts.IPv6 && utun.HaveIPv6 {
+	rules := netcfg.LogDropRules(o)
+	if t.opts.IPv6 {
 		o6 := o
 		o6.IPv6 = true
-		o6.TunPeer6 = utun.Peer6.String()
-		o6.NoLoopbackPass = true // the inet ruleset already passes lo0
-		rules = mergeRulesets(rules, netcfg.SteerRules(o6))
+		rules = mergeRulesets(rules, netcfg.LogDropRules(o6))
 	}
 	return rules, nil
 }
@@ -796,15 +783,15 @@ func (t *Transport) startObserver(ctx context.Context, iface string) {
 // allocation per packet beyond what proto.Parse and Tmpl.Marshal require.
 func (t *Transport) run(ctx context.Context) error {
 	t.mu.Lock()
-	utun, mtu := t.utun, t.mtu
+	plog := t.plog
 	t.mu.Unlock()
-	if utun == nil {
-		return errors.New("divert: datapath started without a utun")
+	if plog == nil {
+		return errors.New("divert: datapath started without pflog")
 	}
 
 	// The utun hands us at most one MTU-sized packet plus the 4-byte framing
 	// header; the slack absorbs a larger MTU set behind our back.
-	buf := make([]byte, utunAFPrefixLen+mtu+512)
+	buf := make([]byte, pflogBufLen)
 	lastGC := time.Now()
 	consecutiveErrs := 0
 
@@ -817,13 +804,13 @@ func (t *Transport) run(ctx context.Context) error {
 		default:
 		}
 
-		ver, pkt, ok, err := utun.Read(buf, readPollInterval)
+		ver, pkt, ok, err := plog.Read(buf, readPollInterval)
 		if err != nil {
 			// A closed or revoked descriptor is fatal; anything else is counted
 			// and retried, because dropping the datapath over one bad read would
 			// take the user's network with it.
 			if errors.Is(err, unix.EBADF) || errors.Is(err, unix.ENXIO) {
-				return fmt.Errorf("divert: utun read failed fatally: %w", err)
+				return fmt.Errorf("divert: pflog read failed fatally: %w", err)
 			}
 			t.st.errs.Add(1)
 			if errors.Is(err, unix.ENOBUFS) {
@@ -831,7 +818,7 @@ func (t *Transport) run(ctx context.Context) error {
 			}
 			consecutiveErrs++
 			if consecutiveErrs > maxConsecutiveReadErrors {
-				return fmt.Errorf("divert: %d consecutive utun read errors, last: %w",
+				return fmt.Errorf("divert: %d consecutive pflog read errors, last: %w",
 					consecutiveErrs, err)
 			}
 			continue
@@ -1016,12 +1003,12 @@ func (t *Transport) Reload(s *strategy.Strategy) error {
 	}
 	t.mu.Lock()
 	t.strat = s
-	pf, utun := t.pf, t.utun
+	pf, plog := t.pf, t.plog
 	t.mu.Unlock()
 
 	t.eng.Reload(s)
 
-	if pf == nil || utun == nil {
+	if pf == nil || plog == nil {
 		return nil // not started yet; Start will render the new window
 	}
 	rules, err := t.steerRules()
@@ -1101,15 +1088,15 @@ func (t *Transport) teardown() error {
 	defer t.lifeMu.Unlock()
 
 	t.mu.Lock()
-	obs, pf, utun, inj := t.obs, t.pf, t.utun, t.inj
+	obs, pf, utun, plog, inj := t.obs, t.pf, t.utun, t.plog, t.inj
 	ownPF := t.ownPF
 	obsCancel, obsDone := t.obsCancel, t.obsDone
-	t.obs, t.pf, t.utun, t.inj = nil, nil, nil, nil
+	t.obs, t.pf, t.utun, t.plog, t.inj = nil, nil, nil, nil, nil
 	t.ownPF = false
 	t.obsCancel, t.obsDone = nil, nil
 	t.mu.Unlock()
 
-	if obs == nil && pf == nil && utun == nil && inj == nil && obsCancel == nil {
+	if obs == nil && pf == nil && utun == nil && plog == nil && inj == nil && obsCancel == nil {
 		// Nothing to claim: either nothing was installed or a previous teardown
 		// already unwound it. Deliberately NOT a latch — an earlier no-op call
 		// must not stop a later one from unwinding a real install (that is exactly
@@ -1161,6 +1148,9 @@ func (t *Transport) teardown() error {
 	// would make pf drop the steered packets instead of passing them.
 	if utun != nil {
 		add("closing the utun", utun.Close())
+	}
+	if plog != nil {
+		add("closing the pflog interceptor", plog.Close())
 	}
 	if inj != nil {
 		add("closing the injector", inj.Close())

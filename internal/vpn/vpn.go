@@ -72,6 +72,12 @@ type signature struct {
 // adding it here, deliberately.
 var signatures = []signature{
 	{
+		Name:          "Happ",
+		AppName:       "Happ",
+		LabelPrefixes: []string{"su.ffg.happ"},
+		ProcNames:     []string{"Happ"},
+	},
+	{
 		Name:       "AmneziaVPN",
 		AppName:    "AmneziaVPN",
 		PlistNames: []string{"AmneziaVPN.plist"},

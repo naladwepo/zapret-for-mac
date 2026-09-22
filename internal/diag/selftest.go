@@ -2,6 +2,7 @@ package diag
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -25,8 +26,9 @@ import (
 // The URL scheme selects what is measured:
 //
 //	https://host/path   full request: TLS handshake, request, response, body
-//	tls://host[:port]   TLS handshake only — for endpoints that speak a protocol
-//	                    we do not (gateway.discord.gg is a WebSocket endpoint)
+//	tls://host[:port]   TLS handshake only
+//	wss://host/path     TLS plus a real WebSocket HTTP Upgrade
+//	stun://host:port    UDP STUN binding request/response
 //	ping://host[:port]  TCP reachability only, no TLS
 //
 // "ping" is a TCP connect, not ICMP: an unprivileged process cannot send ICMP
@@ -57,9 +59,13 @@ type Probe struct {
 	Control bool
 }
 
-// Kind returns the probe's measurement mode: "https", "tls" or "tcp".
+// Kind returns the probe's measurement mode.
 func (p Probe) Kind() string {
 	switch {
+	case strings.HasPrefix(p.URL, "wss://"):
+		return "wss"
+	case strings.HasPrefix(p.URL, "stun://"):
+		return "stun"
 	case strings.HasPrefix(p.URL, "tls://"):
 		return "tls"
 	case strings.HasPrefix(p.URL, "ping://"):
@@ -270,6 +276,24 @@ func DefaultProbes() []Probe {
 	}
 }
 
+// DiscordProbes exercises the desktop client's network paths without launching
+// it. The public STUN peer is intentionally on UDP/19302: this traverses the
+// same Flowseal UDP port window and l7=stun profile used for Discord voice.
+func DiscordProbes() []Probe {
+	const dl = 32 * 1024
+	return []Probe{
+		{Name: "control example.com", URL: "https://example.com/", Control: true, Expect: 200},
+		{Name: "discord API", URL: "https://discord.com/api/v10/gateway"},
+		{Name: "discord Gateway WSS", URL: "wss://gateway.discord.gg/?v=10&encoding=json"},
+		{Name: "discord invite", URL: "https://discord.gg/"},
+		{Name: "discord CDN", URL: "https://cdn.discordapp.com/", Download: dl},
+		{Name: "discord media", URL: "https://media.discordapp.net/", Download: dl},
+		{Name: "discord updater", URL: "https://updates.discord.com/"},
+		{Name: "discord stable updater", URL: "https://stable.dl2.discordapp.net/"},
+		{Name: "UDP/STUN voice path", URL: "stun://stun.l.google.com:19302"},
+	}
+}
+
 // reTargetsLine is deliberately not a regexp: the upstream format is
 // `Key = "value"` with '#' comments, which Cut handles without a dependency.
 
@@ -400,10 +424,128 @@ func RunProbe(ctx context.Context, p Probe, o RunOpts) Result {
 		runTCPProbe(ctx, p, o, &res)
 	case "tls":
 		runTLSProbe(ctx, p, o, &res)
+	case "wss":
+		runWebSocketProbe(ctx, p, o, &res)
+	case "stun":
+		runSTUNProbe(ctx, p, &res)
 	default:
 		runHTTPProbe(ctx, p, o, &res)
 	}
 	return res
+}
+
+// runWebSocketProbe verifies the HTTP Upgrade after TLS; a TLS-only check can
+// pass even when an intermediary kills the Gateway protocol transition.
+func runWebSocketProbe(ctx context.Context, p Probe, o RunOpts, res *Result) {
+	u, err := url.Parse(p.URL)
+	if err != nil || u.Hostname() == "" {
+		res.Class, res.Err = ClassBadURL, "bad WebSocket URL: "+p.URL
+		return
+	}
+	host, addr := u.Hostname(), u.Host
+	if u.Port() == "" {
+		addr = net.JoinHostPort(host, "443")
+	}
+	res.SNI = host
+	start := time.Now()
+	conn, err := o.dial(ctx, addr)
+	res.ConnectTime = time.Since(start)
+	if err != nil {
+		res.Class, res.Err, res.TotalTime = ClassifyError(err), err.Error(), time.Since(start)
+		return
+	}
+	defer conn.Close()
+	if ra := conn.RemoteAddr(); ra != nil {
+		res.ServerIP = ra.String()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"}})
+	hsStart := time.Now()
+	if err := tc.HandshakeContext(ctx); err != nil {
+		res.TLSTime, res.TotalTime = time.Since(hsStart), time.Since(start)
+		res.Class, res.Err = ClassifyError(err), err.Error()
+		return
+	}
+	res.TLSTime = time.Since(hsStart)
+	st := tc.ConnectionState()
+	res.TLSVersion, res.ALPN = tlsVersionName(st.Version), st.NegotiatedProtocol
+	path := u.RequestURI()
+	if path == "" {
+		path = "/"
+	}
+	req := "GET " + path + " HTTP/1.1\r\nHost: " + u.Host +
+		"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" +
+		"Origin: https://discord.com\r\n\r\n"
+	if _, err := io.WriteString(tc, req); err != nil {
+		res.Class, res.Err, res.TotalTime = ClassifyError(err), err.Error(), time.Since(start)
+		return
+	}
+	line, err := bufio.NewReader(tc).ReadString('\n')
+	res.FirstByteTime, res.TotalTime = time.Since(start), time.Since(start)
+	if err != nil {
+		res.Class, res.Err = ClassifyError(err), err.Error()
+		return
+	}
+	var proto string
+	if _, err := fmt.Sscanf(strings.TrimSpace(line), "%s %d", &proto, &res.Status); err != nil {
+		res.Class, res.Err = ClassOther, "malformed WebSocket response: "+strings.TrimSpace(line)
+		return
+	}
+	if res.Status != http.StatusSwitchingProtocols {
+		res.Class, res.Err = ClassHTTPStatus, fmt.Sprintf("expected HTTP 101, got %d", res.Status)
+		return
+	}
+	res.OK, res.Class = true, ClassOK
+}
+
+// runSTUNProbe sends a UDP binding request and validates the transaction ID.
+func runSTUNProbe(ctx context.Context, p Probe, res *Result) {
+	_, addr, err := hostPort(p.URL, "3478")
+	if err != nil {
+		res.Class, res.Err = ClassBadURL, err.Error()
+		return
+	}
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	res.ConnectTime = time.Since(start)
+	if err != nil {
+		res.Class, res.Err, res.TotalTime = ClassifyError(err), err.Error(), time.Since(start)
+		return
+	}
+	defer conn.Close()
+	if ra := conn.RemoteAddr(); ra != nil {
+		res.ServerIP = ra.String()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	tx := [12]byte{0x7a, 0x61, 0x70, 0x72, 0x65, 0x74, 0x2d, 0x6d, 0x61, 0x63, 0x01, 0x00}
+	req := make([]byte, 20)
+	req[0], req[1] = 0x00, 0x01
+	copy(req[4:8], []byte{0x21, 0x12, 0xa4, 0x42})
+	copy(req[8:20], tx[:])
+	if _, err := conn.Write(req); err != nil {
+		res.Class, res.Err, res.TotalTime = ClassifyError(err), err.Error(), time.Since(start)
+		return
+	}
+	buf := make([]byte, 1500)
+	n, err := conn.Read(buf)
+	res.FirstByteTime, res.TotalTime = time.Since(start), time.Since(start)
+	if err != nil {
+		res.Class, res.Err = ClassifyError(err), err.Error()
+		return
+	}
+	res.Bytes = int64(n)
+	if n < 20 || buf[0] != 0x01 || buf[1] != 0x01 ||
+		!bytes.Equal(buf[4:8], []byte{0x21, 0x12, 0xa4, 0x42}) || !bytes.Equal(buf[8:20], tx[:]) {
+		res.Class, res.Err = ClassOther, "malformed or mismatched STUN binding response"
+		return
+	}
+	res.OK, res.Class = true, ClassOK
 }
 
 // hostPort splits a probe URL of the form scheme://host[:port] and applies a
