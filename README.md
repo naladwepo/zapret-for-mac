@@ -31,17 +31,20 @@ All 21 upstream strategies are here, converted automatically from the original `
 brew tap naladwepo/zapret
 brew install --cask zapret-for-mac
 
-sudo /usr/local/libexec/zapretd install-daemon \
+sudo "$(brew --prefix)/libexec/zapretd" install-daemon \
   --plist /Library/LaunchDaemons/io.zapretmac.zapretd.plist \
-  --data /opt/homebrew/var/zapret-mac \
-  --transport divert
+  --data "$(brew --prefix)/var/zapret-mac" \
+  --transport divert --allow-vpn
 
-sudo zaprctl vpn stop            # a full-tunnel VPN makes desync pointless
 sudo zaprctl use cloud-gaming
+
+# If using Happ, import the split-routing profile and reconnect Happ
+zaprctl router happ --install
+
 zaprctl test --suite discord
 ```
 
-> **Через Homebrew.** `brew tap naladwepo/zapret` и `brew install --cask zapret-for-mac` ставят готовые arm64-бинарники и данные. `install-daemon --transport divert` регистрирует штатный pflog/BPF daemon в launchd; `sudo zaprctl use cloud-gaming` включает общий профиль Discord, YouTube и cloud gaming.
+> **Через Homebrew.** `brew tap naladwepo/zapret` и `brew install --cask zapret-for-mac` ставят готовые arm64-бинарники и данные. `install-daemon --transport divert --allow-vpn` регистрирует штатный pflog/BPF daemon в launchd и допускает split-routing VPN; `sudo zaprctl use cloud-gaming` включает общий профиль Discord, YouTube и cloud gaming.
 
 ### From source / Из исходников
 
@@ -61,9 +64,9 @@ zaprctl test --suite discord
 
 > **Быстрый старт.** `make install` собирает и ставит один штатный демон, списки и стратегию `cloud-gaming`; отдельный dev-каталог больше не нужен. Убедись, что Happ подключён, затем запусти `zaprctl router happ --install` и переподключи VPN. После этого `zaprctl test --suite discord` проверит API, Gateway WebSocket, CDN, updater и голосовой UDP/STUN без ручного запуска Discord.
 
-**Requirements:** macOS on Apple Silicon, Go 1.26+, root to run. **Not** required: disabling SIP, kernel extensions, NetworkExtension entitlements, a paid Apple Developer account, a reboot, or notarization.
+**Requirements:** macOS on Apple Silicon and root to run; Go 1.26+ is needed only when building from source. **Not** required: disabling SIP, kernel extensions, NetworkExtension entitlements, a paid Apple Developer account, a reboot, or notarization.
 
-> **Требования:** macOS на Apple Silicon, Go 1.26+, root для запуска. **Не** требуется: отключать SIP, kext, NetworkExtension, платный Apple Developer, перезагрузка, нотаризация.
+> **Требования:** macOS на Apple Silicon и root для запуска; Go 1.26+ нужен только для сборки из исходников. **Не** требуется: отключать SIP, kext, NetworkExtension, платный Apple Developer, перезагрузка, нотаризация.
 
 Подробная схема маршрутизации для Happ: [PFLOG_PORT_RU.md](PFLOG_PORT_RU.md).
 
